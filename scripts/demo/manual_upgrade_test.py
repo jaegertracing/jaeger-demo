@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -144,8 +145,8 @@ class ManualUpgradeTests(unittest.TestCase):
                                             for obj in pinned), name)
                 if key == ("", "secrets") and writes & {"create", "update", "delete"}:
                     history, = [obj for _, _, obj in guarded if obj["metadata"]["name"] == m.PREFIX + "-history"]
-                    self.assertIn("default/prometheus", history["spec"]["validations"][1]["expression"])
-                    self.assertNotIn("jaeger/jaeger", history["spec"]["validations"][1]["expression"])
+                    # Exactly the six releases: the policy also matches the user's Stage 1 Jaeger history writes.
+                    self.assertIn(json.dumps(list(p.HISTORY)), history["spec"]["validations"][1]["expression"])
                 elif names == [""] or "create" in writes:
                     # Collection create and create-time escalation: only the twelve reviewed hook names.
                     self.assertTrue(any("CREATE" in ops and obj["metadata"]["name"].startswith(m.PREFIX + "-hook-inventory-")
@@ -216,6 +217,52 @@ class ManualUpgradeTests(unittest.TestCase):
 
         with mock.patch.object(m.subprocess, "run", side_effect=moved), self.assertRaisesRegex(ValueError, "changed namespace"):
             m.server_defaults([(service, "default")], ["kubectl"])
+
+    def policy(self, guards, name):
+        found, = [g for g in guards if g["kind"] == "ValidatingAdmissionPolicy" and g["metadata"]["name"] == name]
+        return found["spec"]
+
+    def test_statefulset_storage_is_preserved_whatever_the_pod_spec_does(self):
+        stateful = next(o for o in self.pinned if o["kind"] == "StatefulSet")
+        expression = m.surface_expression(stateful)
+        storage, transition = expression.split(") && ((", 1)
+        for field in ("volumeClaimTemplates", "persistentVolumeClaimRetentionPolicy", "selector", "serviceName", "replicas"):
+            self.assertIn('"' + field + '"', storage)
+            self.assertNotIn('"' + field + '"', transition)
+        self.assertIn("oldObject", storage)
+        self.assertNotIn("persistentVolumeClaimRetentionPolicy", m.surface_expression(next(o for o in self.pinned if o["kind"] == "Deployment")))
+
+    def test_history_admits_canonical_records_of_all_six_releases(self):
+        spec = self.policy(self.guards, m.PREFIX + "-history")
+        for release in p.HISTORY:
+            self.assertIn('"' + release + '"', spec["validations"][1]["expression"])
+        self.assertIn("default/jaeger", p.HISTORY)
+        self.assertIn("jaeger/jaeger", p.HISTORY)
+
+    def test_manual_hook_inventory_and_preservation_cover_only_the_hooks(self):
+        def target(spec):
+            return [c["expression"] for c in spec["matchConditions"] if c["name"] == "reviewed-target"]
+        self.assertEqual(target(self.policy(self.guards, m.PREFIX + "-hook-inventory-configmaps")), ["request.namespace == 'default'"])
+        self.assertEqual(target(self.policy(self.guards, m.PREFIX + "-hook-inventory-clusterroles")), [])
+        for kind in ("roles", "clusterroles"):
+            scoped, = target(self.policy(self.guards, m.PREFIX + "-hook-preserve-" + kind))
+            self.assertIn("request.name in", scoped)
+        executor, _ = hooks.controls(self.hooks)
+        for name in ("jaeger-demo-hook-inventory-configmaps", "jaeger-demo-hook-preserve-roles", "jaeger-demo-hook-preserve-clusterroles"):
+            self.assertEqual(target(self.policy(executor, name)), [])
+
+    def test_caller_supplied_chart_archives_must_match_the_checksum_lock(self):
+        locks = json.loads((m.ROOT / m.scheduled_inputs.LOCK).read_bytes())["charts"]
+        with tempfile.TemporaryDirectory() as scratch:
+            located = {key: Path(scratch) / name for key, name in zip(m.RELEASE_KEYS, sorted(locks))}
+            for path in located.values():
+                path.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "differs from the reviewed checksum"):
+                m.verified_archives(located)
+            located["otel-demo"] = Path(scratch) / "opentelemetry-demo-0.0.0.tgz"
+            located["otel-demo"].write_bytes(b"unlocked")
+            with self.assertRaisesRegex(ValueError, "differs from the reviewed checksum"):
+                m.verified_archives(located)
 
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):

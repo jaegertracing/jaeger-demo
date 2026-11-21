@@ -29,12 +29,19 @@ renders two lists from the reviewed commit:
 
 | File | Contents |
 | --- | --- |
-| `guards.json` | ValidatingAdmissionPolicies that match only the `demo-apply` Kubernetes user, fail closed, and deny every write unless `default/jaeger-demo-deployment-revisions` is held by a manual run (`manual/<run>/<attempt>`). Each object that carries privilege must keep its current security surface or take exactly the one in this commit's server-defaulted render: Role and ClusterRole rules, binding subjects and role references, the pod spec of every Deployment, DaemonSet and StatefulSet, the `Prometheus` and `Alertmanager` specs the operator turns into pods, Service type, `externalIPs` and `externalName`, and admission webhooks apart from the rotated `caBundle`. The twelve monitoring hooks must match the reviewed hooks exactly, as for the executor. Secret writes must be canonical Helm history records of the four releases, except the three chart-owned monitoring Secrets. |
+| `guards.json` | ValidatingAdmissionPolicies that match only the `demo-apply` Kubernetes user, fail closed, and deny every write unless `default/jaeger-demo-deployment-revisions` is held by a manual run (`manual/<run>/<attempt>`). Each object that carries privilege must keep its current security surface or take exactly the one in this commit's server-defaulted render: Role and ClusterRole rules, binding subjects and role references, the pod spec of every Deployment, DaemonSet and StatefulSet, the `Prometheus` and `Alertmanager` specs the operator turns into pods, Service type, `externalIPs` and `externalName`, and admission webhooks apart from the rotated `caBundle`. A StatefulSet's storage identity (claim templates, PVC retention policy, selector, service name and replica count) must stay as it is, whatever the pod spec does, because a `Delete` retention policy with fewer replicas lets the controller delete data volumes. The twelve monitoring hooks must match the reviewed hooks exactly, as for the executor. Secret writes must be canonical Helm history records of the six releases, except the three chart-owned monitoring Secrets. |
 | `grants.json` | Roles bound to the same user: named `get,patch` on the reviewed matrix records of the three components, named `escalate` and `bind` on the chart's existing roles, the hook lifecycle verbs, history Secret writes in `default`, `opensearch` and `otel-demo`, and the reads Helm's `--wait` needs. No namespace, storage, CRD, exec or port-forward rights. |
 
 The executor's own policies match only its service account and a running daily
 request, so the two packages do not overlap. Their object names share no prefix
 (`jaeger-demo-manual-*`).
+
+The policies match every request by the user, so they also apply to its Stage 1
+rights. Every `demo-apply` workflow (deploy, OpenSearch recovery and volume
+expansion) takes the manual lock first. The Secret policy admits canonical history
+records of both Jaeger releases, and the hook inventory and RBAC preservation
+policies cover only the hooks' namespace and roles, so Jaeger upgrades and the
+recovery script's ConfigMaps keep working.
 
 ## Render and review
 
@@ -49,6 +56,7 @@ python3 ops/executor/manual_upgrade.py --user "$demo_apply_user" \
 ```
 
 The script verifies the chart archives against `ops/executor/chart-archives.json`,
+including archives passed with `--charts`,
 renders the four releases as upgrades, and asks the API server to default a renamed
 copy of each pinned object with a nonpersistent `create --dry-run=server`. It refuses
 a dirty checkout, a rendered privileged object without a matrix record, and a
@@ -84,6 +92,10 @@ Removing the grants returns `demo-apply` to its Stage 1 scope.
   `default`, `opensearch` and `otel-demo`.
 - OpenSearch recovery (`opensearch_recovery=required`) needs storage access this
   package does not grant. Use the separate recovery workflow or record a waiver.
+- While the package is installed, the user cannot create or delete a ServiceAccount,
+  ConfigMap, Role, RoleBinding or Job in `default` other than the reviewed hooks. A
+  Jaeger chart version that adds such an object in `default` needs the package
+  removed for its upgrade.
 
 ## Tests
 
@@ -93,10 +105,12 @@ manual lock, and that no name collides with the executor package. The `Monitorin
 hooks and Helm history` check in `executor-ci.yml` renders the pinned charts,
 installs the package on a disposable API server and, as the manual user, denies a
 wildcard rule on an escalatable ClusterRole, image, service account, hostPath and
-privileged changes to workloads, Service `externalIPs`, a `Prometheus` service
+privileged changes to workloads, an OpenSearch PVC retention or replica change, Service `externalIPs`, a `Prometheus` service
 account change, a binding subject change, a webhook policy change, a hook-named
-binding to the user, a cluster-admin binding, foreign Helm records and Secrets, and
-every write without a manual lock or parameter. It admits metadata changes, a
-restored reviewed rule set, a webhook CA rotation, the reviewed hooks and a
-canonical history record. A real Helm upgrade under these grants is a separate
+binding to the user, a cluster-admin binding, arbitrary Secrets, an unreviewed
+ConfigMap in `default`, and every write without a manual lock or parameter. It
+admits metadata changes, a restored reviewed rule set, a webhook CA rotation, the
+reviewed hooks and canonical history records. With a stand-in for the Stage 1
+Roles, which are not in the repository, it also admits Jaeger history records in
+`default` and `jaeger` and a recovery ConfigMap in `opensearch`. A real Helm upgrade under these grants is a separate
 rehearsal.

@@ -26,6 +26,17 @@ SERVER = ("resourceVersion", "uid", "creationTimestamp", "managedFields", "gener
 CRDS = ("crd-prometheuses.yaml", "crd-alertmanagers.yaml")
 PIN = "Privileged fields differ from the reviewed render"
 LOCK = "A manual deployment lock holder is required"
+HISTORY = "Only canonical Helm history records"
+# A stand-in for the hand-applied Stage 1 Roles, which are not in the repository: Jaeger history writes
+# and the recovery script's ConfigMap writes. The package must leave both working under a manual lock.
+STAGE1 = {"jaeger": [("", "secrets", ["create", "update", "delete"])],
+          "opensearch": [("", "configmaps", ["create", "delete"])]}
+
+
+def stage1_fixture():
+    rules = {ns: [r.rule(group, target, verbs) for group, target, verbs in found] for ns, found in STAGE1.items()}
+    return [item for ns, scoped in rules.items()
+            for item in r.bindings("fixture-stage1-apply", ns, scoped, (), subjects=m.subjects_for(USER))]
 
 
 def install_operator_crds(archive, kube, scratch):
@@ -66,7 +77,7 @@ def exercise(charts, kubectl, cfg, kube):
     admin = [kubectl, "--kubeconfig", str(cfg), "--context", "fixture"]
     as_user = ["--as", USER, "--as-group", "system:authenticated"]
     allowed, denied = [], []
-    for ns in ("opensearch", "otel-demo", r.OPS):
+    for ns in ("jaeger", "opensearch", "otel-demo", r.OPS):
         kube(["create", "namespace", ns], check=False)
     checkpoint = r.resource("v1", "ConfigMap", r.CHECKPOINT, "default")
     checkpoint["metadata"]["annotations"] = {r.PROTOCOL: "v1", r.HOLDER: "manual/123/1"}
@@ -79,7 +90,7 @@ def exercise(charts, kubectl, cfg, kube):
         definitions = hooks.pinned_hooks(located["oci-monitoring"])
         defaulted_hooks = hooks.dry_admitted(definitions, admin)
     guards, grants = m.package(USER, defaulted, defaulted_hooks)
-    for item in guards + grants:
+    for item in guards + grants + stage1_fixture():
         kube(["create", "-f", "-"], body=json.dumps(item))
     for obj in defaulted:
         kube(["create", "-f", "-"], body=json.dumps(live(obj)))
@@ -117,6 +128,12 @@ def exercise(charts, kubectl, cfg, kube):
     kube(["replace", "-f", "-"], body=json.dumps(older))
     expect_allowed("ClusterRole rules restored to the reviewed render",
                    patch("clusterrole", "prometheus-kube-state-metrics", None, [{"op": "replace", "path": "/rules", "value": ksm["rules"]}]))
+
+    retention = {"spec": {"replicas": 0, "persistentVolumeClaimRetentionPolicy": {"whenScaled": "Delete", "whenDeleted": "Delete"}}}
+    expect_denied("OpenSearch PVC retention Delete with zero replicas",
+                  patch("statefulset", "opensearch-cluster-single", "opensearch", retention, "merge"), PIN)
+    expect_denied("OpenSearch scaled to zero", patch("statefulset", "opensearch-cluster-single", "opensearch",
+                  {"spec": {"replicas": 0}}, "merge"), PIN)
 
     container = "/spec/template/spec/containers/0"
     expect_denied("Deployment image change", patch("deployment", "prometheus-kube-prometheus-operator", "default",
@@ -163,12 +180,19 @@ def exercise(charts, kubectl, cfg, kube):
     canonical = record("otel-demo", "otel-demo")
     canonical["metadata"]["labels"] = {"owner": "helm", "name": "otel-demo", "version": "99", "status": "pending-upgrade"}
     expect_allowed("canonical OTel demo history record", user(["create", "-f", "-", "--dry-run=server"], json.dumps(canonical)))
-    jaeger = record("default", "jaeger")
-    jaeger["metadata"]["labels"] = {"owner": "helm", "name": "jaeger", "version": "99", "status": "pending-upgrade"}
-    expect_denied("Jaeger history record outside this package", user(["create", "-f", "-", "--dry-run=server"], json.dumps(jaeger)),
-                  "Only the four canonical")
-    stray = r.resource("v1", "Secret", "fixture-stray", "otel-demo", stringData={"token": "fixture"})
-    expect_denied("arbitrary Secret", user(["create", "-f", "-", "--dry-run=server"], json.dumps(stray)), "Only the four canonical")
+    for namespace in ("default", "jaeger"):
+        jaeger = record(namespace, "jaeger")
+        jaeger["metadata"]["labels"] = {"owner": "helm", "name": "jaeger", "version": "99", "status": "pending-upgrade"}
+        expect_allowed(f"Stage 1 Jaeger history record in {namespace}",
+                       user(["create", "-f", "-", "--dry-run=server"], json.dumps(jaeger)))
+    for namespace in ("otel-demo", "jaeger"):
+        stray = r.resource("v1", "Secret", "fixture-stray", namespace, stringData={"token": "fixture"})
+        expect_denied(f"arbitrary Secret in {namespace}", user(["create", "-f", "-", "--dry-run=server"], json.dumps(stray)), HISTORY)
+    restore = r.resource("v1", "ConfigMap", "jaeger-os-restore-fixture", "opensearch", data={"fixture": "true"})
+    expect_allowed("Stage 1 recovery ConfigMap in opensearch", user(["create", "-f", "-", "--dry-run=server"], json.dumps(restore)))
+    rogue = r.resource("v1", "ConfigMap", "fixture-rogue", "default", data={"fixture": "true"})
+    expect_denied("unreviewed ConfigMap in the hook namespace", user(["create", "-f", "-", "--dry-run=server"], json.dumps(rogue)),
+                  "Only the twelve")
 
     def touch():
         return patch("deployment", "prometheus-kube-prometheus-operator", "default", label, "merge")

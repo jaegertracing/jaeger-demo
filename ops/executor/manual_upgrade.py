@@ -43,7 +43,9 @@ PREFIX = "jaeger-demo-manual"
 COMPONENTS = ("oci-monitoring", "opensearch", "otel-demo")
 RELEASE_KEYS = ("oci-monitoring", "opensearch", "opensearch-dashboards", "otel-demo")
 NAMESPACES = ("default", "opensearch", "otel-demo")
-HISTORY = ("default/prometheus", "opensearch/opensearch", "opensearch/opensearch-dashboards", "otel-demo/otel-demo")
+# The Secret policy matches every Secret write by the user, including its Stage 1 Jaeger history writes,
+# so it admits the canonical records of all six releases.
+HISTORY = r.HISTORY
 ARCHIVE = "jaeger-demo-manual-monitoring-crds"
 HOLDER_PATTERN = "^manual/[0-9]+/[0-9]+$"
 RBAC_GROUP = "rbac.authorization.k8s.io"
@@ -65,6 +67,10 @@ SURFACE = {
     # externalIPs can intercept a cluster IP's traffic (CVE-2020-8554); type and externalName change exposure and routing.
     "Service": [(("spec", "type"), "ClusterIP"), (("spec", "externalIPs"), []), (("spec", "externalName"), None)],
 }
+# StatefulSet storage identity never changes through this identity, whatever the pod spec does: a retention
+# policy of Delete with fewer replicas lets the controller delete data PVCs (scheduled_adapter.validate_change).
+STATEFUL_STORAGE = [(("spec", "volumeClaimTemplates"), []), (("spec", "persistentVolumeClaimRetentionPolicy"), None),
+                    (("spec", "selector"), REQUIRED), (("spec", "serviceName"), None), (("spec", "replicas"), 1)]
 OPERATOR_KINDS = {"Prometheus": ("monitoring.coreos.com", "prometheuses"), "Alertmanager": ("monitoring.coreos.com", "alertmanagers")}
 KINDS = {**{kind: gvr for gvr, kind in r.GVR.items() if kind in SURFACE}, **OPERATOR_KINDS, **WEBHOOKS}
 PINNED = {gvr: kind for kind, gvr in KINDS.items()}
@@ -156,6 +162,9 @@ def surface_expression(reviewed):
         keep = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in SURFACE[kind])
         take = " && ".join(f"{value('object', p, d)} == dyn({r.literal(at(reviewed, p, d))})" for p, d in SURFACE[kind])
     expression = "(" + keep + ") || (" + take + ")"
+    if kind == "StatefulSet":
+        storage = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in STATEFUL_STORAGE)
+        expression = "(" + storage + ") && (" + expression + ")"
     r.require(len(expression.encode()) <= MAX_EXPRESSION, f"{kind}/{reviewed['metadata']['name']} is too large for a native content policy")
     return expression
 
@@ -202,7 +211,7 @@ def lock_gates(rows, policies):
 
 def history(policies):
     guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], r.history_expression(HISTORY),
-                      "Only the four canonical chart Helm history records may change",
+                      "Only canonical Helm history records of the six releases may change",
                       condition=r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")",
                       variables=[{"name": "records", "expression": r.HISTORY_RECORDS}])
     # The three chart-owned monitoring Secrets may change with the chart (documented residual risk);
@@ -244,7 +253,7 @@ def package(user, defaulted, defaulted_hooks):
     policies = policy_builder(user)
     guards = pins(defaulted, policies) + lock_gates(records(), policies) + history(policies)
     hook_guards, hook_grants = hooks.controls(defaulted_hooks, policies=policies, lock=None, archive_name=ARCHIVE,
-                                              prefix=PREFIX, subjects=subjects, account_guards=False)
+                                              prefix=PREFIX, subjects=subjects, account_guards=False, scoped=True)
     return guards + hook_guards, grants(defaulted, subjects) + hook_grants
 
 
@@ -277,11 +286,22 @@ def server_defaults(objects, kube):
     return result
 
 
+def verified_archives(located):
+    """A caller-supplied chart directory is untrusted: each rendered archive must match the reviewed checksum lock."""
+    locks = json.loads((ROOT / scheduled_inputs.LOCK).read_bytes())["charts"]
+    for key in RELEASE_KEYS:
+        path = located[key]
+        r.require(path.name in locks and path.is_file() and not path.is_symlink()
+                  and hashlib.sha256(path.read_bytes()).hexdigest() == locks[path.name],
+                  "Chart archive differs from the reviewed checksum: " + path.name)
+    return located
+
+
 def render_pinned(charts, scratch):
     """Render the four releases and supplements. Returns ([(pinned object, namespace)], {release key: archive})."""
     kube_version = json.loads(r.MATRIX.read_bytes())["targetKubernetes"]
     env = {"PATH": os.environ["PATH"], "KUBECONFIG": os.devnull, "HOME": str(scratch)}
-    located = access_matrix.packages(Path(charts), ROOT)
+    located = verified_archives(access_matrix.packages(Path(charts), ROOT))
     pinned = []
     for key in RELEASE_KEYS:
         namespace = adapter.RELEASES[key][0]

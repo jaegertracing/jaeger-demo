@@ -5,11 +5,16 @@
 #
 # Resolve and verify Jaeger demo snapshot image tags from Docker Hub.
 #
-# Scheduled runs prefer MAIN_SHA when published; otherwise they deploy the
-# newest published commit SHA tag (never the mutable :latest tag).
+# Scheduled runs without an explicit tag prefer MAIN_SHA when published;
+# otherwise they deploy the newest published commit SHA tag (never the mutable
+# :latest tag). The search reads at most MAX_TAG_PAGES pages of the tag list.
 #
-# Manual workflow_dispatch runs use the requested tag (default MAIN_SHA), resolve
-# latest to a concrete SHA tag, and fail if the requested tag is missing.
+# An explicit tag must use Docker tag syntax and exist on Docker Hub for every
+# event, including a schedule. An explicit latest is verified, then resolved to
+# a concrete SHA tag.
+#
+# Manual workflow_dispatch runs use the requested tag (default MAIN_SHA) and
+# fail if that tag is missing.
 #
 # Jaeger and HotROD tags are resolved independently; each image is
 # published to its own repository and may fall back to a different SHA.
@@ -25,6 +30,11 @@ set -euo pipefail
 : "${JAEGER_DEMO_HOTROD_IMAGE_REPOSITORY:=jaegertracing/example-hotrod-snapshot}"
 : "${MAIN_SHA:=}"
 : "${GITHUB_EVENT_NAME:=workflow_dispatch}"
+
+# Both snapshot repositories publish a SHA tag for almost every tag, so the
+# newest one is normally on the first page. The limit bounds a malformed or
+# unexpected listing.
+readonly MAX_TAG_PAGES=10
 
 if [[ -z "$MAIN_SHA" ]]; then
   echo "MAIN_SHA must be set to the resolved jaegertracing/jaeger commit" >&2
@@ -57,29 +67,39 @@ dockerhub_tag_status() {
 
 newest_published_sha() {
   local repo=$1
-  local status
-  local tag
-  local tags_file
+  local status tag tags_file
+  local page=1
+  local url="https://hub.docker.com/v2/repositories/${repo}/tags/?page_size=100&ordering=last_updated"
 
   tags_file=$(mktemp "${TMPDIR:-/tmp}/docker-tags-page.XXXXXX")
-
-  status=$(run_curl -o "$tags_file" -w "%{http_code}" \
-    "https://hub.docker.com/v2/repositories/${repo}/tags/?page_size=100&ordering=last_updated" || true)
-  status=${status:-000}
-  if [[ "$status" != "200" ]]; then
-    rm -f "$tags_file"
-    echo "Docker Hub tag list for ${repo} returned HTTP ${status}" >&2
-    return 1
-  fi
-
-  # Both snapshot repos have far more than one page of SHA tags, so we rely on
-  # ordering=last_updated to surface the newest tags on the first (only) page we
-  # fetch, then sort that page by last_updated as a guard against out-of-order
-  # results and take the newest. This does not scan beyond the first page.
-  if ! tag=$(jq -r '[.results[] | select(.name | test("^[0-9a-f]{40}$"))] | sort_by(.last_updated) | last | .name // empty' "$tags_file"); then
-    rm -f "$tags_file"
-    return 1
-  fi
+  while :; do
+    status=$(run_curl -o "$tags_file" -w "%{http_code}" "$url" || true)
+    if [[ "${status:-000}" != "200" ]]; then
+      rm -f "$tags_file"
+      echo "Docker Hub tag list for ${repo} returned HTTP ${status:-000}" >&2
+      return 1
+    fi
+    if ! tag=$(jq -r '[.results[] | select(.name | test("^[0-9a-f]{40}$"))] | sort_by(.last_updated) | last | .name // empty' "$tags_file"); then
+      rm -f "$tags_file"
+      return 1
+    fi
+    if [[ -n "$tag" ]] || ! jq -e '.next != null' "$tags_file" >/dev/null; then
+      break
+    fi
+    # Keep requests on the intended repository when following ordered pages.
+    page=$((page + 1))
+    if (( page > MAX_TAG_PAGES )); then
+      rm -f "$tags_file"
+      echo "No snapshot SHA tag in the first ${MAX_TAG_PAGES} pages of ${repo} tags" >&2
+      return 1
+    fi
+    if ! jq -e --argjson page "$page" '.count > (($page - 1) * 100)' "$tags_file" >/dev/null; then
+      rm -f "$tags_file"
+      echo "Invalid pagination for ${repo} SHA tags" >&2
+      return 1
+    fi
+    url="https://hub.docker.com/v2/repositories/${repo}/tags/?page_size=100&ordering=last_updated&page=${page}"
+  done
   rm -f "$tags_file"
 
   if [[ -z "$tag" ]]; then
@@ -110,6 +130,7 @@ resolve_snapshot_tag() {
   local repo=$1
   local preferred=$2
   local label=$3
+  local override=$4
   local status
   local resolved
 
@@ -118,7 +139,15 @@ resolve_snapshot_tag() {
     return 1
   fi
 
+  # Docker tag syntax only. A value such as "?" or ".." addresses another Docker Hub
+  # endpoint that answers 200, which would pass as an existing tag.
+  if [[ ! "$preferred" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo "::error::Invalid snapshot image tag syntax (${label})" >&2
+    return 1
+  fi
+
   if [[ "$preferred" == "latest" ]]; then
+    verify_deploy_tag "$repo" "$preferred" "$label" || return 1
     resolved=$(newest_published_sha "$repo") || return 1
     echo "$resolved"
     return 0
@@ -134,7 +163,7 @@ resolve_snapshot_tag() {
     return 1
   fi
 
-  if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
+  if [[ "$GITHUB_EVENT_NAME" != "schedule" || -n "$override" ]]; then
     echo "::error::Snapshot image tag not found on Docker Hub: ${repo}:${preferred} (${label})" >&2
     return 1
   fi
@@ -160,11 +189,11 @@ main() {
   local hotrod_tag
   local main_status
 
-  jaeger_preferred="${JAEGER_DEMO_JAEGER_IMAGE_TAG:-${JAEGER_DEMO_IMAGE_TAG:-$MAIN_SHA}}"
-  hotrod_preferred="${JAEGER_DEMO_HOTROD_IMAGE_TAG:-${JAEGER_DEMO_IMAGE_TAG:-$MAIN_SHA}}"
+  jaeger_preferred="${JAEGER_DEMO_JAEGER_IMAGE_TAG:-${JAEGER_DEMO_IMAGE_TAG:-}}"
+  hotrod_preferred="${JAEGER_DEMO_HOTROD_IMAGE_TAG:-${JAEGER_DEMO_IMAGE_TAG:-}}"
 
-  jaeger_tag=$(resolve_snapshot_tag "$JAEGER_DEMO_JAEGER_IMAGE_REPOSITORY" "$jaeger_preferred" "Jaeger")
-  hotrod_tag=$(resolve_snapshot_tag "$JAEGER_DEMO_HOTROD_IMAGE_REPOSITORY" "$hotrod_preferred" "HotROD")
+  jaeger_tag=$(resolve_snapshot_tag "$JAEGER_DEMO_JAEGER_IMAGE_REPOSITORY" "${jaeger_preferred:-$MAIN_SHA}" "Jaeger" "$jaeger_preferred")
+  hotrod_tag=$(resolve_snapshot_tag "$JAEGER_DEMO_HOTROD_IMAGE_REPOSITORY" "${hotrod_preferred:-$MAIN_SHA}" "HotROD" "$hotrod_preferred")
 
   verify_deploy_tag "$JAEGER_DEMO_JAEGER_IMAGE_REPOSITORY" "$jaeger_tag" "Jaeger"
   verify_deploy_tag "$JAEGER_DEMO_HOTROD_IMAGE_REPOSITORY" "$hotrod_tag" "HotROD"

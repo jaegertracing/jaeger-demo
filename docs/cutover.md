@@ -138,6 +138,11 @@ writes by attempting them. RBAC grants are additive, so inspect other bindings a
 well. Keep an independent administrator recovery route. The restricted writer is
 not authorized to rebuild the installation or repair missing unrelated objects.
 
+This table is the Stage 1 Jaeger scope. Manual upgrades of monitoring, OpenSearch
+and the OTel demo add a separately installed package of named grants fenced by
+admission policies, described in [manual upgrade access](manual-upgrade-access.md).
+It keeps storage, namespaces, CRDs, exec and port-forward excluded.
+
 ## Transfer workflow ownership
 
 1. Verify the concrete handover record with the human. Confirm tools, chart

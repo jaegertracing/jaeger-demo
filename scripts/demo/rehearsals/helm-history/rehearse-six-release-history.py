@@ -73,6 +73,8 @@ def main():
     parser.add_argument("--frozen-transaction", action="store_true", help="Exercise the scripts-v1 signed-render Helm transaction")
     parser.add_argument("--monitoring-lookup", type=Path, help="Verify full chart dry-run and real Grafana Secret lookup")
     parser.add_argument("--monitoring-hook-access", type=Path, help="Verify RBAC/admission using the twelve pinned monitoring hooks")
+    parser.add_argument("--manual-upgrade-access", type=Path, metavar="CHARTS",
+                        help="Verify the manual deploy identity's guarded grants with the pinned charts in this directory")
     parser.add_argument("--jaeger-patch-methods", type=Path, help="Audit real Jaeger chart SSA/CSA upgrade patch permissions")
     parser.add_argument("--typed-approval-rehearsal", action="store_true",
                         help="Use a fresh API exclusively for the per-slot workload admission rehearsal")
@@ -564,6 +566,11 @@ def main():
             if args.monitoring_hook_access:
                 from monitoring_hook_access import exercise as exercise_hook_access
                 report["monitoringHookAccess"] = exercise_hook_access(args.monitoring_hook_access, kubectl, cfg, kube)
+            if args.manual_upgrade_access:
+                if args.monitoring_hook_access:
+                    raise ValueError("The manual upgrade fixture creates its own checkpoint; run it on a separate API")
+                from manual_upgrade_access import exercise as exercise_manual_upgrade
+                report["manualUpgradeAccess"] = exercise_manual_upgrade(args.manual_upgrade_access.resolve(), kubectl, cfg, kube)
             if args.frozen_transaction:
                 from frozen_transaction import exercise
                 report["frozenTransaction"] = exercise(root, cfg, kubectl, chart, WRITER)

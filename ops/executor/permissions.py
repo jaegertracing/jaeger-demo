@@ -49,10 +49,11 @@ def resource(api, kind, name, namespace=None, **fields):
     return {"apiVersion": api, "kind": kind, "metadata": meta, **fields}
 
 
-def bindings(name, scope, rules, accounts):
+def bindings(name, scope, rules, accounts, *, subjects=None):
     cluster = scope == "cluster"
     kind = "ClusterRole" if cluster else "Role"
-    subjects = [{"kind": "ServiceAccount", "name": who, "namespace": OPS} for who in accounts]
+    if subjects is None:
+        subjects = [{"kind": "ServiceAccount", "name": who, "namespace": OPS} for who in accounts]
     return [resource(RBAC, kind, name, scope, rules=rules),
             resource(RBAC, kind + "Binding", name, scope, subjects=subjects,
                      roleRef={"apiGroup": RBAC.split("/")[0], "kind": kind, "name": name})]
@@ -122,20 +123,28 @@ def policies(name, group, target, operations, expression, message, *, condition=
                            "paramRef": {"namespace": OPS, "name": "daily-hosted-update", "parameterNotFoundAction": "Deny"}})]
 
 
+HISTORY_RECORDS = 'request.operation == "UPDATE" ? [oldObject, object] : [request.operation == "DELETE" ? oldObject : object]'
+# Chart-owned Secrets in default that Helm updates in place; every other Secret write must be a history record.
+CHART_SECRET_UPDATE = 'request.operation != "UPDATE" || !(request.namespace == "default" && request.name in '
+
+
+def history_expression(history=HISTORY):
+    """CEL that admits only canonical Helm history records of the listed namespace/release pairs."""
+    return ('variables.records.all(s, s != null && s.type == "helm.sh/release.v1" && '
+            'has(s.data) && size(s.data) == 1 && "release" in s.data && '
+            'has(s.metadata.labels) && ["owner","name","version","status"].all(k, k in s.metadata.labels) && '
+            's.metadata.labels.owner == "helm" && s.metadata.labels.version.matches("^[1-9][0-9]*$") && '
+            's.metadata.name == "sh.helm.release.v1." + s.metadata.labels.name + ".v" + s.metadata.labels.version && '
+            '(request.namespace + "/" + s.metadata.labels.name) in ' + json.dumps(list(history)) + ') && '
+            '(request.operation != "CREATE" || object.metadata.labels.status in ["pending-upgrade", "pending-rollback"])')
+
+
 def history_guard():
     # Base envelope is the same one rehearsed with Helm's real upgrade, failure, pruning and rollback.
-    records = 'request.operation == "UPDATE" ? [oldObject, object] : [request.operation == "DELETE" ? oldObject : object]'
-    expression = ('variables.records.all(s, s != null && s.type == "helm.sh/release.v1" && '
-                  'has(s.data) && size(s.data) == 1 && "release" in s.data && '
-                  'has(s.metadata.labels) && ["owner","name","version","status"].all(k, k in s.metadata.labels) && '
-                  's.metadata.labels.owner == "helm" && s.metadata.labels.version.matches("^[1-9][0-9]*$") && '
-                  's.metadata.name == "sh.helm.release.v1." + s.metadata.labels.name + ".v" + s.metadata.labels.version && '
-                  '(request.namespace + "/" + s.metadata.labels.name) in ' + json.dumps(HISTORY) + ') && '
-                  '(request.operation != "CREATE" || object.metadata.labels.status in ["pending-upgrade", "pending-rollback"])')
     history = policies("jaeger-demo-executor-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"],
-                    expression, "Only the six canonical hosted Helm history records may change",
-                    condition='request.operation != "UPDATE" || !(request.namespace == "default" && request.name in '+json.dumps(MONITORING_SECRETS)+')',
-                    variables=[{"name": "records", "expression": records}])
+                    history_expression(), "Only the six canonical hosted Helm history records may change",
+                    condition=CHART_SECRET_UPDATE+json.dumps(MONITORING_SECRETS)+')',
+                    variables=[{"name": "records", "expression": HISTORY_RECORDS}])
     allowed = 'request.namespace == "default" && request.name in '+json.dumps(MONITORING_SECRETS)
     same = same_except("oldObject","object",["metadata"])+" && "+same_except("oldObject.metadata","object.metadata",["managedFields","resourceVersion","generation"])
     history += policies("jaeger-demo-history-chart-secrets","","secrets",["UPDATE"],same,

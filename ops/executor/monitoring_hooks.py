@@ -95,11 +95,17 @@ def hook_account_guards():
         yield r.resource(r.ADMISSION, "ValidatingAdmissionPolicyBinding", name, spec=spec)
 
 
-def controls(objects):
+def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_name=ARCHIVE, prefix="jaeger-demo",
+             subjects=None, account_guards=True):
+    """Guards and grants for the twelve hooks. The defaults render the executor's package.
+
+    ops/executor/manual_upgrade.py passes its own policy builder, which matches the manual
+    deploy identity and checks the manual lock in every policy, so it needs no separate lock.
+    """
     by_target = defaultdict(list)
     grant_rules = defaultdict(list)
     archive, = [obj["binaryData"] for obj in objects if obj["kind"] == "ConfigMap"]
-    guards = [r.resource("v1", "ConfigMap", ARCHIVE, r.OPS, immutable=True, binaryData=archive)]
+    guards = [r.resource("v1", "ConfigMap", archive_name, r.OPS, immutable=True, binaryData=archive)]
     for obj in objects:
         kind, meta = obj["kind"], obj["metadata"]
         group, target = KINDS[kind]
@@ -118,23 +124,25 @@ def controls(objects):
             # The reviewed CRD archive exceeds 256 KiB. CEL compares the bytes to a separate immutable
             # operator-owned ConfigMap; its body never becomes a policy or last-applied annotation.
             exact = "(" + exact + " && s.binaryData == params.binaryData)"
-        tag = "jaeger-demo-hook-" + hashlib.sha256((kind + "/" + name).encode()).hexdigest()[:16]
+        tag = prefix + "-hook-" + hashlib.sha256((kind + "/" + name).encode()).hexdigest()[:16]
         predicate = "request.name == " + json.dumps(name) + (" && request.namespace == 'default'" if scope != "cluster" else "")
         match = [{"name": "records", "expression": "request.operation == 'DELETE' ? [oldObject] : [object]"}]
-        policy, binding = r.policies(tag, group, target, ["CREATE","DELETE"], "variables.records.all(s, " + exact + ")",
-                                     "Hook differs from the independently reviewed monitoring baseline", condition=predicate, variables=match)
+        policy, binding = policies(tag, group, target, ["CREATE","DELETE"], "variables.records.all(s, " + exact + ")",
+                                   "Hook differs from the independently reviewed monitoring baseline", condition=predicate, variables=match)
         if kind == "ConfigMap":
-            # The separate inventory gate below also requires a running protected request.
+            # The separate inventory gate below also requires a running protected request
+            # (or, for the manual package, the manual lock).
             policy["spec"]["validations"] = policy["spec"]["validations"][1:]
-            binding["spec"]["paramRef"]["name"] = ARCHIVE
+            binding["spec"]["paramRef"].update(namespace=r.OPS, name=archive_name)
         guards.extend([policy, binding])
     for (scope, group, target), names in sorted(by_target.items()):
         valid = "request.name in " + json.dumps(sorted(names))
         if scope != "cluster":
             valid = "request.namespace == 'default' && " + valid
-        guards.extend(r.policies("jaeger-demo-hook-inventory-" + target, group, target, ["CREATE", "DELETE"],
-                                 valid, "Only the twelve reviewed monitoring hooks may be created or deleted"))
-        guards.extend(r.checkpoint_lock("jaeger-demo-hook-holder-" + target, group, target, ["CREATE", "DELETE"], None))
+        guards.extend(policies(prefix + "-hook-inventory-" + target, group, target, ["CREATE", "DELETE"],
+                               valid, "Only the twelve reviewed monitoring hooks may be created or deleted"))
+        if lock:
+            guards.extend(lock(prefix + "-hook-holder-" + target, group, target, ["CREATE", "DELETE"], None))
         grant_rules[scope].append(r.rule(group, target, ["create"]))
         grant_rules[scope].append(r.rule(group, target, ["get","delete"], names))
         if target in {"roles","clusterroles"}:
@@ -146,11 +154,13 @@ def controls(objects):
                     '&& (!has(object.aggregationRule) || object.aggregationRule == oldObject.aggregationRule)'
                     if target == "clusterroles" else 'object.rules == oldObject.rules')
             same += " && has(object.metadata.labels) == has(oldObject.metadata.labels) && (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels)"
-            guards.extend(r.policies("jaeger-demo-hook-preserve-" + target, group, target, ["UPDATE"], same,
-                                     "Existing RBAC rules and aggregation must be preserved"))
-    guards.extend(hook_account_guards())
-    grant_rules[r.OPS].append(r.rule("", "configmaps", ["get"], [ARCHIVE]))
-    grants = [item for scope, rules in grant_rules.items() for item in r.bindings("jaeger-demo-monitoring-hook",scope,rules,(r.EXECUTOR,))]
+            guards.extend(policies(prefix + "-hook-preserve-" + target, group, target, ["UPDATE"], same,
+                                   "Existing RBAC rules and aggregation must be preserved"))
+    if account_guards:
+        guards.extend(hook_account_guards())
+    grant_rules[r.OPS].append(r.rule("", "configmaps", ["get"], [archive_name]))
+    grants = [item for scope, rules in grant_rules.items()
+              for item in r.bindings(prefix + "-monitoring-hook", scope, rules, (r.EXECUTOR,), subjects=subjects)]
     return guards, grants
 
 

@@ -63,6 +63,11 @@ jobs:
         python3 scripts/demo/rehearsals/helm-history/rehearse-six-release-history.py \
           --assets "$RUNNER_TEMP/controller-tools/envtest" --receipt "$RUNNER_TEMP/hook-result.json" \
           --monitoring-hook-access "$MONITORING_CHART"
+    - name: Verify the manual deploy identity's guarded grants deny privilege changes
+      run: |
+        python3 scripts/demo/rehearsals/helm-history/rehearse-six-release-history.py \
+          --assets "$RUNNER_TEMP/controller-tools/envtest" --receipt "$RUNNER_TEMP/manual-upgrade.json" \
+          --manual-upgrade-access "$RUNNER_TEMP/chart-sources/charts"
     - name: Verify the full monitoring render, frozen upgrade and rollback under restricted identities
       run: |
         python3 scripts/demo/rehearsals/helm-history/rehearse-six-release-history.py \

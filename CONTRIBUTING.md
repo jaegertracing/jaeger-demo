@@ -114,7 +114,7 @@ make renovate-discovery
 The script runs the configuration validator, the extraction, and the checker. Set
 `CONTAINER_ENGINE=podman` to use Podman instead of Docker. Renovate considers hosted updates daily, waits
 seven days, and never automerges them. Preserve paired OpenSearch/Dashboards 3.x
-updates and the PostgreSQL/Valkey major constraints. Do not duplicate dependency
+updates. Do not duplicate dependency
 bumps already managed by automation.
 
 ## Production changes

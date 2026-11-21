@@ -402,7 +402,67 @@ testPinnedChartRendersCollectorStartupProbe() {
 
   resources=$(printf '%s\n' "$rendered" |
     sed -n '/^[[:space:]]*resources:$/,/^[[:space:]]*volumeMounts:$/p')
-  assertContains "$resources" "memory: 200Mi"
+  # Chart default; 0.42 raised it from 200Mi.
+  assertContains "$resources" "memory: 400Mi"
+}
+
+testPinnedChartRendersReviewedApplicationShape() {
+  local chart_version
+  local rendered
+  local render_rc
+  local count
+  local pipeline
+  local attribute
+
+  chart_version=$(bash -c \
+    'source "$1"; printf "%s" "$OTEL_DEMO_CHART_VERSION"' \
+    _ "$SCRIPT")
+
+  rendered=$(helm template otel-demo opentelemetry-demo \
+    --repo https://open-telemetry.github.io/opentelemetry-helm-charts \
+    --version "$chart_version" \
+    --namespace otel-demo \
+    --values "$(dirname "$SCRIPT")/otel-demo-values.yaml")
+  render_rc=$?
+
+  assertEquals "pinned OTel Demo chart should render" 0 "$render_rc"
+  [[ "$render_rc" -eq 0 ]] || return
+
+  # The agent's recorded responses do not fit the daily executor's approval partitions.
+  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-(agent|mcp|chatbot)'?\$" || true)
+  assertEquals "the assistant stack should stay disabled" 0 "$count"
+  assertNotContains "$rendered" "name: agent-fixtures"
+  # The shop's public proxy would expose the OpAMP server's unauthenticated interface.
+  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-opamp-server'?\$" || true)
+  assertEquals "the OpAMP server should stay disabled" 0 "$count"
+  count=$(printf '%s\n' "$rendered" | grep -c -E 'value: "?wss?://opamp-server' || true)
+  assertEquals "no service should be configured to reach an OpAMP server" 0 "$count"
+  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-telemetry-docs'?\$" || true)
+  assertEquals "the telemetry documentation should be deployed" 1 "$count"
+
+  count=$(printf '%s\n' "$rendered" | grep -E 'image: .*busybox' | grep -c -v '@sha256:' || true)
+  assertEquals "every busybox init container should be pinned by digest" 0 "$count"
+
+  # product-catalog emits no traces without the chart's SDK configuration file.
+  assertContains "$rendered" "value: /otel-config.yml"
+  assertContains "$rendered" "astronomy_user:astronomy_password@astronomy-db/astronomy_db"
+  assertNotContains "$rendered" "@postgresql/"
+
+  # Jaeger is public. The chart's emitRawPii flag puts the customer's email, card
+  # number and CVV on checkout and payment spans, and the collector override
+  # replaces the chart pipeline that would remove them.
+  pipeline=$(printf '%s\n' "$rendered" | awk '
+    /^ +pipelines:$/ { inside = 1; next }
+    inside && /^ +processors:$/ { list = 1; next }
+    list && /^ +- / { sub(/^ +- /, ""); printf "%s ", $0; next }
+    list { exit }
+  ')
+  assertEquals "the trace pipeline should drop raw personal data before batching" \
+    "memory_limiter k8s_attributes resource transform/drop_raw_pii batch " "$pipeline"
+  for attribute in user.email demo.payment.card_number demo.payment.card_cvv; do
+    count=$(printf '%s\n' "$rendered" | grep -c -F "delete_key(attributes, \"$attribute\")" || true)
+    assertEquals "the collector should delete $attribute from spans" 1 "$count"
+  done
 }
 
 testPinnedChartRendersCheckoutMemoryHeadroom() {

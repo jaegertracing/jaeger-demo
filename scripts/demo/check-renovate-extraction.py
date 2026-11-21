@@ -20,8 +20,6 @@ expected = {
     ("examples/otel-demo/deploy-all.sh", "opentelemetry-demo"),
     ("examples/otel-demo/jaeger-values.yaml", "jaegertracing/jaeger-es-index-cleaner"),
     ("examples/otel-demo/otel-demo-values.yaml", "docker.io/busybox"),
-    ("examples/otel-demo/otel-demo-values.yaml", "docker.io/valkey/valkey"),
-    ("examples/otel-demo/otel-demo-values.yaml", "docker.io/library/postgres"),
     ("examples/otel-demo/load-generator.yaml", "python"),
     ("examples/otel-demo/load-generator/requirements.txt", "requests"),
     ("scripts/demo/jaeger-chart.sh", "https://github.com/jaegertracing/helm-charts.git"),

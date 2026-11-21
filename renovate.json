@@ -44,16 +44,6 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": [
-        "/^examples\\/otel-demo\\/otel-demo-values\\.yaml$/"
-      ],
-      "matchStrings": [
-        "imageOverride:\\s+repository: (?<depName>\\S+)\\s+tag: \"(?<currentValue>[^\"@]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\""
-      ],
-      "datasourceTemplate": "docker"
-    },
-    {
-      "customType": "regex",
       "description": "Track digests for the three monitoring hook image tags",
       "managerFilePatterns": [
         "/^examples\\/oci\\/monitoring-values\\.yaml$/"
@@ -231,26 +221,6 @@
         "https://github.com/jaegertracing/helm-charts.git"
       ],
       "groupName": "Hosted demo Jaeger chart"
-    },
-    {
-      "description": "PostgreSQL major upgrades need an explicit migration before changing the supported line",
-      "matchFileNames": [
-        "examples/otel-demo/otel-demo-values.yaml"
-      ],
-      "matchPackageNames": [
-        "docker.io/library/postgres"
-      ],
-      "allowedVersions": "/^17\\./"
-    },
-    {
-      "description": "Valkey major upgrades need an explicit compatibility review before changing the supported line",
-      "matchFileNames": [
-        "examples/otel-demo/otel-demo-values.yaml"
-      ],
-      "matchPackageNames": [
-        "docker.io/valkey/valkey"
-      ],
-      "allowedVersions": "/^8\\./"
     },
     {
       "matchFileNames": [

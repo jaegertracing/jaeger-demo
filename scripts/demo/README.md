@@ -9,8 +9,9 @@ Renovate checks the two hosted demo directories daily. Releases must be at least
 every update. OpenSearch and Dashboards remain a matched chart pair. Other updates
 are grouped by deployment component. Charts own their bundled image versions;
 direct image overrides and load-generator requirements are tracked separately.
-PostgreSQL, Valkey, and OpenSearch stay within their configured major lines until
-a reviewed migration or compatibility change updates that constraint.
+OpenSearch stays within its configured major line until a reviewed migration or
+compatibility change updates that constraint. The OpenTelemetry Demo chart owns
+its PostgreSQL and Valkey images.
 
 Manual deployment runs use the reviewed `demo-apply` environment. The 13:00 UTC
 job on main uses `demo-scheduled` after activation through the

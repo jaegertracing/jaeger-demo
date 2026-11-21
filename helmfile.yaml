@@ -101,7 +101,7 @@ releases:
     namespace: otel-demo
     labels: {stack: otel, component: otel-demo}
     chart: open-telemetry/opentelemetry-demo
-    version: "0.40.9"
+    version: "0.42.7"
     needs:
       - jaeger/jaeger
     timeout: 900

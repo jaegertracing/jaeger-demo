@@ -1,7 +1,7 @@
 # Copyright (c) 2026 The Jaeger Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-# Official values for the pinned chart are at https://raw.githubusercontent.com/open-telemetry/opentelemetry-helm-charts/opentelemetry-demo-0.40.9/charts/opentelemetry-demo/values.yaml
+# Official values for the pinned chart are at https://raw.githubusercontent.com/open-telemetry/opentelemetry-helm-charts/opentelemetry-demo-0.42.7/charts/opentelemetry-demo/values.yaml
 
 # Keep bundled infra disabled (we deploy Jaeger/OpenSearch separately)
 jaeger:
@@ -65,6 +65,10 @@ components:
       - name: wait-for-valkey-cart
         image: docker.io/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
         command: ["sh", "-c", "until nc -z -v -w30 valkey-cart 6379; do echo waiting for valkey-cart; sleep 2; done;"]
+    # No OpAMP server runs here (see opamp-server below). An empty endpoint turns the client off.
+    envOverrides:
+      - name: OPAMP_SERVER_ENDPOINT
+        value: ""
 
   checkout:
     initContainers:
@@ -112,38 +116,54 @@ components:
       - name: LOCUST_SPAWN_RATE
         value: "2"
 
-  valkey-cart:
-    imageOverride:
-      repository: docker.io/valkey/valkey
-      tag: "8.1.12-alpine@sha256:9971099af41c36e887aabdfe22b80c0fe45df949163dfc9cb434febc57cfc3fc"
-
-  postgresql:
-    imageOverride:
-      repository: docker.io/library/postgres
-      tag: "17.12@sha256:b60e90042aa6b8dbecd58e224b3e36114dbf8ad754465264c2476ad58a86e45c"
+  # The chart owns the Valkey and PostgreSQL images (valkey-cart and astronomy-db).
+  # Both hold disposable demo data. Only the database memory limit is raised.
+  astronomy-db:
     resources:
       limits:
         memory: 256Mi
 
+  # Keep the chart's environment: the service reads its SDK setup from the
+  # mounted OTEL_CONFIG_FILE and emits no traces without it. That file also
+  # configures log and metric export, which the traces-only collector rejects.
   product-catalog:
-    env:
-      - name: PRODUCT_CATALOG_PORT
-        value: "8080"
-      - name: FLAGD_HOST
-        value: flagd
-      - name: FLAGD_PORT
-        value: "8013"
+    initContainers:
+      - name: wait-for-astronomy-db
+        image: docker.io/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
+        command: ["sh", "-c", "until nc -z -v -w30 astronomy-db 5432; do echo waiting for astronomy-db; sleep 2; done;"]
+    envOverrides:
       - name: GOMEMLIMIT
         value: 48MiB
-      - name: DB_CONNECTION_STRING
-        value: postgres://otelu:otelp@postgresql/otel?sslmode=disable
-      - name: OTEL_SEMCONV_STABILITY_OPT_IN
-        value: database
-      - name: OTEL_EXPORTER_OTLP_ENDPOINT
-        value: http://$(OTEL_COLLECTOR_NAME):4317
+      # No OpAMP server runs here (see opamp-server below). An empty endpoint turns the client off.
+      - name: OPAMP_SERVER_ENDPOINT
+        value: ""
     resources:
       limits:
         memory: 64Mi
+
+  shipping:
+    initContainers:
+      - name: wait-for-flagd
+        image: docker.io/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
+        command: ["sh", "-c", "until nc -z -v -w30 flagd 8013; do echo waiting for flagd; sleep 2; done;"]
+
+  # The assistant stack stays off. Enabling the agent makes the chart render an
+  # 828 KB ConfigMap of recorded LLM responses, and the daily executor's
+  # approval partitions hold at most 640 KiB. The load generator still asks the
+  # agent on about one request in eleven; those requests fail and appear as
+  # error spans from the load-generator service.
+  agent:
+    enabled: false
+  mcp:
+    enabled: false
+
+  # The shop's proxy serves the OpAMP server's interface at /opamp/, and the
+  # shop is public. That interface changes client configuration and connection
+  # settings without authentication, so the server is not deployed.
+  opamp-server:
+    enabled: false
+  chatbot:
+    enabled: false
 
 # Override Collector config to export traces to Jaeger only and drop demo metrics/logs
 opentelemetry-collector:
@@ -206,6 +226,18 @@ opentelemetry-collector:
           - key: service.instance.id
             from_attribute: k8s.pod.uid
             action: insert
+      # The chart's emitRawPii feature flag makes checkout and payment put the
+      # customer's email, card number and CVV on their spans. The chart removes them
+      # in its default collector pipeline, which alternateConfig replaces. Jaeger is
+      # public here, so drop the three attributes whatever the flag says.
+      transform/drop_raw_pii:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              - delete_key(attributes, "user.email")
+              - delete_key(attributes, "demo.payment.card_number")
+              - delete_key(attributes, "demo.payment.card_cvv")
       batch: {}
     exporters:
       otlp/jaeger:
@@ -225,5 +257,5 @@ opentelemetry-collector:
       pipelines:
         traces:
           receivers: [otlp]
-          processors: [memory_limiter, k8sattributes, resource, batch]
+          processors: [memory_limiter, k8sattributes, resource, transform/drop_raw_pii, batch]
           exporters: [otlp/jaeger]

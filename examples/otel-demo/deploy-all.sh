@@ -22,7 +22,7 @@ RUN_PUBLIC_SMOKE_TESTS="${RUN_PUBLIC_SMOKE_TESTS:-false}"
 DEPLOY_SCOPE="${JAEGER_DEMO_DEPLOY_SCOPE:-${JAEGER_OTEL_DEMO_DEPLOY_SCOPE:-jaeger}}"
 OPENSEARCH_RECOVERY="${JAEGER_OTEL_DEMO_OPENSEARCH_RECOVERY:-}"
 # renovate: datasource=helm depName=opentelemetry-demo registryUrl=https://open-telemetry.github.io/opentelemetry-helm-charts
-OTEL_DEMO_CHART_VERSION="0.40.9"
+OTEL_DEMO_CHART_VERSION="0.42.7"
 # renovate: datasource=helm depName=opensearch registryUrl=https://opensearch-project.github.io/helm-charts
 OPENSEARCH_CHART_VERSION="3.7.0"
 # renovate: datasource=helm depName=opensearch-dashboards registryUrl=https://opensearch-project.github.io/helm-charts
@@ -290,7 +290,7 @@ diagnose_otel_demo_failure() {
   kubectl -n otel-demo describe deployment frontend || true
   kubectl -n otel-demo describe deployment frontend-proxy || true
   kubectl -n otel-demo describe deployment load-generator || true
-  kubectl -n otel-demo describe deployment postgresql || true
+  kubectl -n otel-demo describe deployment astronomy-db || true
   kubectl -n otel-demo describe deployment product-catalog || true
   collect_otel_collector_logs
   kubectl -n otel-demo logs -l opentelemetry.io/name=frontend --all-containers --tail=200 --prefix || true
@@ -298,9 +298,9 @@ diagnose_otel_demo_failure() {
   kubectl -n otel-demo logs -l opentelemetry.io/name=load-generator --all-containers --tail=200 --prefix || true
   kubectl -n otel-demo logs -l opentelemetry.io/name=checkout --all-containers --tail=200 --prefix || true
   kubectl -n otel-demo describe pods -l app.kubernetes.io/name=opentelemetry-collector,app.kubernetes.io/instance=otel-demo || true
-  kubectl -n otel-demo describe pods -l opentelemetry.io/name=postgresql || true
+  kubectl -n otel-demo describe pods -l opentelemetry.io/name=astronomy-db || true
   kubectl -n otel-demo describe pods -l opentelemetry.io/name=product-catalog || true
-  kubectl -n otel-demo logs -l opentelemetry.io/name=postgresql --all-containers --tail=200 --prefix || true
+  kubectl -n otel-demo logs -l opentelemetry.io/name=astronomy-db --all-containers --tail=200 --prefix || true
   kubectl -n otel-demo logs -l opentelemetry.io/name=product-catalog --all-containers --tail=200 --prefix || true
   log "Collecting Jaeger diagnostics"
   kubectl -n jaeger get deploy,pods,svc,endpoints -o wide || true

@@ -165,11 +165,18 @@ requires each release to be `deployed` at its chart pin and reads the
 application version with `helm get metadata`, which uses the Helm release
 Secret reads the upgrade already needs.
 
-Once the schedule is enabled, a merged OpenSearch chart change is applied in
-place by the next daily run, without a backup. When an engine upgrade
-should start from a tested recovery point, dispatch the manual `otel` /
-`opensearch` upgrade with `opensearch_recovery=required` and let it finish
-before that day's preparation. The preparation window opens at 11:00 UTC for
+Once the schedule is enabled, a merged change to the OpenSearch chart alone is
+applied in place by the next daily run, without a backup. A Dashboards chart
+version change is not. That chart writes its version into labels on the
+Dashboards ServiceAccount and RoleBinding, and the executor requires those
+protected objects to equal the live release. Preparation then fails with
+"Privileged manifest differs from the operator-established baseline", and the
+daily update stops for every component until a manual upgrade has established
+the new release. The two charts are bumped together, so plan every OpenSearch
+version upgrade as a manual one: merge after the daily run, dispatch the manual
+`otel` / `opensearch` upgrade with `opensearch_recovery=required`, which also
+starts the engine upgrade from a tested recovery point, and let it finish
+before the next preparation. The preparation window opens at 11:00 UTC for
 the 13:00 UTC slot; the CronJob runs at 12:20 UTC, but a one-off preparer Job
 can run earlier. Preparation freezes the checkpoint and Helm history for the
 slot, and a later retry reuses that frozen plan. An upgrade that completes after

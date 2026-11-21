@@ -55,7 +55,7 @@ releases:
     namespace: opensearch
     labels: {stack: otel, component: opensearch}
     chart: opensearch/opensearch
-    version: "3.7.0"
+    version: "3.10.0"
     timeout: 600
     values:
       - examples/otel-demo/opensearch-values.yaml
@@ -64,7 +64,7 @@ releases:
     namespace: opensearch
     labels: {stack: otel, component: opensearch}
     chart: opensearch/opensearch-dashboards
-    version: "3.7.0"
+    version: "3.10.0"
     needs:
       - opensearch/opensearch
     timeout: 3600

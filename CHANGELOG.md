@@ -98,6 +98,11 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   Python 3.11.18 and `jaeger-es-index-cleaner` 2.23.0, each pinned by digest.
   ([#52](https://github.com/jaegertracing/jaeger-demo/pull/52),
   fixes [#51](https://github.com/jaegertracing/jaeger-demo/issues/51))
+- OpenSearch and OpenSearch Dashboards chart pins move from 3.7.0 to 3.10.0. A
+  scheduled run rejects a Dashboards chart change, so the upgrade is a manual
+  `opensearch` deployment.
+  ([#45](https://github.com/jaegertracing/jaeger-demo/pull/45),
+  fixes [#44](https://github.com/jaegertracing/jaeger-demo/issues/44))
 - README leads with the public endpoints table and architecture instead of dated
   handover status.
   ([#28](https://github.com/jaegertracing/jaeger-demo/pull/28),

@@ -133,6 +133,11 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   on the public shop route.
   ([#60](https://github.com/jaegertracing/jaeger-demo/pull/60),
   refs [#57](https://github.com/jaegertracing/jaeger-demo/issues/57))
+- The executor's `jaeger-helm-preview` tool links the Go module versions that
+  Helm 4.3.2 builds with. This clears eight advisories against `golang.org/x/net`
+  and `golang.org/x/text` that were not reachable in the tool. **Executor image.**
+  ([#66](https://github.com/jaegertracing/jaeger-demo/pull/66),
+  fixes [#65](https://github.com/jaegertracing/jaeger-demo/issues/65))
 - OpenSearch recovery and volume-expansion workflows install the constrained OCI
   CLI and verify it before taking the deployment lock.
   ([#24](https://github.com/jaegertracing/jaeger-demo/pull/24),

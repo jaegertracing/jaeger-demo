@@ -140,8 +140,10 @@ def exercise(charts, kubectl, cfg, kube):
                   [{"op": "replace", "path": container + "/image", "value": "registry.invalid/fixture:wrong"}]), PIN)
     expect_denied("Deployment service account change", patch("deployment", "prometheus-grafana", "default",
                   [{"op": "add", "path": "/spec/template/spec/serviceAccountName", "value": "prometheus-kube-prometheus-operator"}]), PIN)
-    expect_denied("privileged node-exporter container", patch("daemonset", "prometheus-prometheus-node-exporter", "default",
-                  [{"op": "add", "path": container + "/securityContext", "value": {"privileged": True}}]), PIN)
+    # envtest's API server runs without --allow-privileged, so validation rejects privileged: true before
+    # admission. An added capability passes validation and reaches the pin.
+    expect_denied("node-exporter container gains CAP_SYS_ADMIN", patch("daemonset", "prometheus-prometheus-node-exporter", "default",
+                  [{"op": "add", "path": container + "/securityContext", "value": {"capabilities": {"add": ["SYS_ADMIN"]}}}]), PIN)
     expect_denied("hostPath volume on an OTel demo Deployment", patch("deployment", "frontend", "otel-demo",
                   [{"op": "add", "path": "/spec/template/spec/volumes", "value": [{"name": "host", "hostPath": {"path": "/"}}]}]), PIN)
     expect_denied("Service externalIPs", patch("service", "frontend-proxy", "otel-demo", {"spec": {"externalIPs": ["10.0.0.10"]}}, "merge"), PIN)

@@ -65,16 +65,31 @@ digests and the object counts. Review `grants.json` in full before installing it
 
 ## Install, use and remove
 
-1. Apply `guards.json` with `kubectl create -f`. The hook CRD archive is too large
+Admission policies and RBAC changes reach the API server asynchronously, so
+creating the guards first does not by itself prove they enforce before the grants
+do. Close that window procedurally, with the `demo-apply` environment reviewer as
+the gate:
+
+1. Confirm that no Deploy, OpenSearch recovery or volume expansion run is in
+   progress or waiting for approval, and that the deployment lock is not held by a
+   `manual/` run. Approve no `demo-apply` deployment until step 5 passes.
+2. Apply `guards.json` with `kubectl create -f`. The hook CRD archive is too large
    for a client-side apply annotation.
-2. Apply `grants.json`. Grants never go in before their guards.
-3. Check the boundary: `kubectl auth can-i --list --as "$demo_apply_user"` for each
-   namespace, and one dry-run patch as the user that the lock policy denies.
-4. Dispatch the manual upgrade from `main` at the same commit. The job takes the
+3. Apply `grants.json`. Grants never go in before their guards.
+4. Prove enforcement while no manual run holds the lock. Every policy then denies,
+   so each of these server dry-runs as `--as "$demo_apply_user"` must fail with
+   `A manual deployment lock holder is required`: a label patch on ClusterRole
+   `prometheus-kube-prometheus-operator`, DaemonSet
+   `default/prometheus-prometheus-node-exporter`, StatefulSet
+   `opensearch/opensearch-cluster-single` and Deployment `otel-demo/frontend`, and a
+   create of the reviewed hook ClusterRole `prometheus-crds-upgrade`. Repeat until
+   all of them are denied; an admitted dry-run means a policy is not loaded yet.
+   Then check `kubectl auth can-i --list --as "$demo_apply_user"` in each namespace.
+5. Approve the manual upgrade from `main` at the same commit. The job takes the
    deployment lock, which is what the policies check.
-5. For the next reviewed commit, delete `grants.json`, then `guards.json`, and
-   install the new package in the same order. To roll back to an earlier commit,
-   render the package from that commit.
+6. For the next reviewed commit, repeat step 1, delete `grants.json`, then
+   `guards.json`, and install the new package from step 2. To roll back to an
+   earlier commit, render the package from that commit.
 
 Removing the grants returns `demo-apply` to its Stage 1 scope.
 
@@ -105,7 +120,7 @@ manual lock, and that no name collides with the executor package. The `Monitorin
 hooks and Helm history` check in `executor-ci.yml` renders the pinned charts,
 installs the package on a disposable API server and, as the manual user, denies a
 wildcard rule on an escalatable ClusterRole, image, service account, hostPath and
-privileged changes to workloads, an OpenSearch PVC retention or replica change, Service `externalIPs`, a `Prometheus` service
+added-capability changes to workloads, an OpenSearch PVC retention or replica change, Service `externalIPs`, a `Prometheus` service
 account change, a binding subject change, a webhook policy change, a hook-named
 binding to the user, a cluster-admin binding, arbitrary Secrets, an unreviewed
 ConfigMap in `default`, and every write without a manual lock or parameter. It

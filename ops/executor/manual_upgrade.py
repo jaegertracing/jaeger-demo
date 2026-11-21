@@ -55,7 +55,9 @@ WEBHOOKS = {"MutatingWebhookConfiguration": ("admissionregistration.k8s.io", "mu
 # The privilege-bearing fields each pinned kind must keep or take from the reviewed render.
 SURFACE = {
     "Role": [(("rules",), []), (("aggregationRule",), None)],
-    "ClusterRole": [(("rules",), []), (("aggregationRule",), None)],
+    # Any ClusterRole label can be selected by an aggregationRule (aggregate-to-view, -edit, -admin), which
+    # copies this role's rules into the selecting role.
+    "ClusterRole": [(("rules",), []), (("aggregationRule",), None), (("metadata", "labels"), {})],
     "RoleBinding": [(("roleRef",), REQUIRED), (("subjects",), [])],
     "ClusterRoleBinding": [(("roleRef",), REQUIRED), (("subjects",), [])],
     "Deployment": [(("spec", "template", "spec"), REQUIRED)],
@@ -83,6 +85,13 @@ def subjects_for(user):
     return [{"kind": "User", "apiGroup": RBAC_GROUP, "name": user}]
 
 
+# The API server resolves a binding's parameter before its match conditions. Without the checkpoint every
+# binding denies matching writes by every client, so the checkpoint itself stays outside them all to keep
+# it recoverable. Recreating it grants nothing beyond taking the lock.
+CHECKPOINT_RULE = {"apiGroups": [""], "apiVersions": ["v1"], "operations": ["*"], "resources": ["configmaps"],
+                   "resourceNames": [r.CHECKPOINT]}
+
+
 def policy_builder(user):
     """A permissions.policies replacement: matches only the manual user and requires the manual lock first."""
     holder = json.dumps(r.HOLDER)
@@ -105,7 +114,8 @@ def policy_builder(user):
         return [r.resource(r.ADMISSION, "ValidatingAdmissionPolicy", name, spec=spec),
                 r.resource(r.ADMISSION, "ValidatingAdmissionPolicyBinding", name, spec={
                     "policyName": name, "validationActions": ["Deny"],
-                    "paramRef": {"namespace": "default", "name": r.CHECKPOINT, "parameterNotFoundAction": "Deny"}})]
+                    "paramRef": {"namespace": "default", "name": r.CHECKPOINT, "parameterNotFoundAction": "Deny"},
+                    "matchResources": {"excludeResourceRules": [CHECKPOINT_RULE]}})]
     return policies
 
 
@@ -269,6 +279,32 @@ def review_copy(obj, namespace):
     return copy_
 
 
+def review_name(obj):
+    return "review-" + hashlib.sha256((obj["kind"] + "/" + obj["metadata"]["name"]).encode()).hexdigest()[:12]
+
+
+def restore_name(value, trial, original):
+    """Put the original name back wherever server defaulting derived it from the trial name (Job labels)."""
+    if isinstance(value, dict):
+        return {k: restore_name(v, trial, original) for k, v in value.items()}
+    if isinstance(value, list):
+        return [restore_name(v, trial, original) for v in value]
+    return original if value == trial else value
+
+
+def dry_admitted_hooks(definitions, kube):
+    """hooks.dry_admitted under renamed copies: a failed hook stays behind (no hook-failed delete policy)
+    and would make an original-name dry-run fail with AlreadyExists, blocking the retry package."""
+    result = []
+    for hook in definitions:
+        original = hook["metadata"]["name"]
+        trial = copy.deepcopy(hook)
+        trial["metadata"]["name"] = review_name(hook)
+        admitted, = hooks.dry_admitted([trial], kube)
+        result.append(restore_name(admitted, trial["metadata"]["name"], original))
+    return result
+
+
 def server_defaults(objects, kube):
     result = []
     for obj, namespace in objects:
@@ -345,7 +381,7 @@ def main():
             charts = staging / "charts"
         pinned, located = render_pinned(charts, scratch)
         defaulted = server_defaults(pinned, kube)
-        defaulted_hooks = hooks.dry_admitted(hooks.pinned_hooks(located["oci-monitoring"]), kube)
+        defaulted_hooks = dry_admitted_hooks(hooks.pinned_hooks(located["oci-monitoring"]), kube)
         guards, granted = package(args.user, defaulted, defaulted_hooks)
         archives = {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}
     args.output.mkdir(mode=0o700)

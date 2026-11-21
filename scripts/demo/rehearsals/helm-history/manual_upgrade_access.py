@@ -88,7 +88,11 @@ def exercise(charts, kubectl, cfg, kube):
         install_operator_crds(located["oci-monitoring"], kube, scratch)
         defaulted = m.server_defaults(pinned, admin)
         definitions = hooks.pinned_hooks(located["oci-monitoring"])
-        defaulted_hooks = hooks.dry_admitted(definitions, admin)
+        # A failed hook Job stays behind (no hook-failed delete policy); rendering must still succeed.
+        leftover = next(d for d in definitions if d["kind"] == "Job")
+        kube(["create", "-f", "-"], body=json.dumps(leftover))
+        defaulted_hooks = m.dry_admitted_hooks(definitions, admin)
+        kube(["-n", "default", "delete", "job", leftover["metadata"]["name"], "--wait=true"])
     guards, grants = m.package(USER, defaulted, defaulted_hooks)
     for item in guards + grants + stage1_fixture():
         kube(["create", "-f", "-"], body=json.dumps(item))
@@ -117,6 +121,10 @@ def exercise(charts, kubectl, cfg, kube):
     first = eventually(lambda: patch("clusterrole", "prometheus-kube-prometheus-operator", None, wildcard),
                        lambda result: result.returncode and PIN in result.stderr)
     expect_denied("cluster-admin rule added to an escalatable ClusterRole", first, PIN)
+
+    aggregate = {"metadata": {"labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}}}
+    expect_denied("aggregation label on an escalatable ClusterRole",
+                  patch("clusterrole", "prometheus-kube-prometheus-operator", None, aggregate, "merge"), PIN)
 
     label = {"metadata": {"labels": {"fixture.jaegertracing.io/touched": "true"}}}
     expect_allowed("metadata-only Deployment patch", patch("deployment", "prometheus-kube-prometheus-operator", "default", label, "merge"))

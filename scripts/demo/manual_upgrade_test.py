@@ -264,6 +264,49 @@ class ManualUpgradeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "differs from the reviewed checksum"):
                 m.verified_archives(located)
 
+    def test_cluster_role_labels_are_pinned_against_aggregation(self):
+        cluster_role = next(o for o in self.pinned if o["kind"] == "ClusterRole")
+        role = next(o for o in self.pinned if o["kind"] == "Role")
+        self.assertIn('["metadata"]["labels"]', m.surface_expression(cluster_role))
+        self.assertNotIn('["labels"]', m.surface_expression(role))
+
+    def test_every_binding_leaves_the_checkpoint_recoverable(self):
+        bindings = [g for g in self.guards if g["kind"] == "ValidatingAdmissionPolicyBinding"]
+        self.assertTrue(bindings)
+        for binding in bindings:
+            self.assertEqual(binding["spec"]["paramRef"]["parameterNotFoundAction"], "Deny")
+            self.assertEqual(binding["spec"]["matchResources"]["excludeResourceRules"], [m.CHECKPOINT_RULE])
+        self.assertEqual(m.CHECKPOINT_RULE["resourceNames"], [p.CHECKPOINT])
+
+    def test_hooks_are_defaulted_under_renamed_copies(self):
+        trials = []
+
+        def admit(argv, *, input, **_):
+            trial = json.loads(input)
+            trials.append(trial["metadata"]["name"])
+            if trial["kind"] == "Job":
+                # The Job API derives template labels from the name; the uid stays the fixture's.
+                trial["spec"]["template"].setdefault("metadata", {}).setdefault("labels", {}).update(
+                    {"job-name": trial["metadata"]["name"], "batch.kubernetes.io/job-name": trial["metadata"]["name"]})
+            return subprocess.CompletedProcess(argv, 0, json.dumps(trial).encode(), b"")
+
+        with mock.patch.object(hooks.subprocess, "run", side_effect=admit):
+            admitted = m.dry_admitted_hooks(self.hooks, ["kubectl"])
+        originals = [h["metadata"]["name"] for h in self.hooks]
+        self.assertFalse(set(trials) & set(originals))
+        self.assertEqual([h["metadata"]["name"] for h in admitted], originals)
+        job = next(h for h in admitted if h["kind"] == "Job")
+        self.assertEqual(job["spec"]["template"]["metadata"]["labels"]["job-name"], job["metadata"]["name"])
+        self.assertNotIn("review-", json.dumps(admitted))
+        with mock.patch.object(hooks.subprocess, "run", side_effect=admit):
+            direct = hooks.dry_admitted(copy.deepcopy(self.hooks), ["kubectl"])
+        self.assertEqual(admitted, direct)
+
+        def controls(objects):
+            return hooks.controls(objects, policies=m.policy_builder(USER), lock=None, archive_name=m.ARCHIVE,
+                                  prefix=m.PREFIX, account_guards=False, scoped=True)
+        self.assertEqual(controls(admitted), controls(direct))
+
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):
             with self.assertRaises(ValueError):

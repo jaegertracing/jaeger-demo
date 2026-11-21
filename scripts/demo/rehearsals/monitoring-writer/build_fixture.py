@@ -21,7 +21,6 @@ VALUES = "2852cb6b1e50687218aef41acf9666106c164d503e3846dc591206c9fe8b2473"
 SEED = "533412f8fa328a3d772901f1c7b17d95ceeb671e9c3b428dd3cd44613132222d"
 ARTIFACT = "monitoring-hook-fixture"
 MARKER = "jaegertracing.io/local-rehearsal-marker"
-ROOT = Path(__file__).resolve().parents[4]
 REVIEWED = "e82c0f9b61666adcccb20cea759f90478f726bc7932a3eca42e274ed39e75dd2"
 
 
@@ -51,7 +50,9 @@ def content_digest(pkg):
 
 def build(args):
     archive = args.archive.resolve()
-    values = ROOT / "examples/oci/monitoring-values.yaml"
+    # The receipt records chart 82.10.4 with the values reviewed for it. The repository's
+    # values have moved on with later charts, so the reviewed copy is kept beside the fixture.
+    values = Path(__file__).with_name("reviewed-monitoring-values.yaml")
     if sha(archive.read_bytes()) != CHART or sha(values.read_bytes()) != VALUES:
         raise ValueError("Pinned public chart or values differ from reviewed inputs")
     out = args.output.resolve()

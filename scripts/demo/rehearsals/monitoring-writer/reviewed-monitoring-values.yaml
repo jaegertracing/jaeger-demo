@@ -1,0 +1,43 @@
+# Copyright (c) 2026 The Jaeger Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for Prometheus , Grafana , Alertmanager can be set from this configuration
+
+# Keep hook tags and digests together so Helm renders the reviewed image on upgrade and rollback.
+crds:
+  upgradeJob:
+    image:
+      busybox:
+        # renovate: datasource=docker depName=docker.io/library/busybox
+        tag: "1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
+      kubectl:
+        # renovate: datasource=docker depName=registry.k8s.io/kubectl
+        tag: "v1.36.1@sha256:d08f476d04d0e30f426f06bc6ff6c38913aaa4591943046b77e2f74a72d3611c"
+
+prometheusOperator:
+  admissionWebhooks:
+    patch:
+      image:
+        # renovate: datasource=docker depName=ghcr.io/jkroepke/kube-webhook-certgen
+        tag: "1.7.8@sha256:e024de71cd416a44edef241519efd7489bf963425578fcb89aa5542b6950c91f"
+
+fullnameOverride: ""
+prometheus:
+  prometheusSpec:
+    enableAdminAPI: true
+    additionalScrapeConfigs: |
+      - job_name: aggregated-trace-metrics
+        static_configs:
+          - targets: ['jaeger-collector-prometheus.default.svc.cluster.local:8889']
+        scrape_interval:     15s
+
+
+grafana:
+  # Allow index creation and plugin installation to finish before liveness checks.
+  livenessProbe:
+    initialDelaySeconds: 600
+  grafana.ini:
+    server:
+      domain: demo.jaegertracing.io
+      root_url: "%(protocol)s://%(domain)s/grafana/"
+      serve_from_sub_path: true

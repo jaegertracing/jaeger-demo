@@ -84,8 +84,13 @@ def monitoring_lookup(root, config, kubectl, kube, apply, package):
     from base64 import b64encode
     import secrets
     package = package.read_bytes()
-    archive = json.loads((a.ROOT / "docs/all-five-chart-access.json").read_bytes())["chartArchiveSHA256"]
-    assert a.sha(package) == archive["kube-prometheus-stack-82.10.4.tgz"]
+    matrix = json.loads((a.ROOT / "docs/all-five-chart-access.json").read_bytes())
+    archive = matrix["chartArchiveSHA256"]
+    # The reviewed matrix lists every object of the monitoring release, hooks included.
+    reviewed_objects = sum((row["component"], row["release"]) == ("oci-monitoring", "prometheus") for row in matrix["records"])
+    # The reviewed matrix names the one monitoring archive that the pinned chart version resolves to.
+    reviewed, = (name for name in archive if name.startswith("kube-prometheus-stack-"))
+    assert a.sha(package) == archive[reviewed]
     path = root / "monitoring-lookup.tgz"
     path.write_bytes(package)
     crds = a.docs(a.command(["helm", "show", "crds", path]))
@@ -119,7 +124,7 @@ def monitoring_lookup(root, config, kubectl, kube, apply, package):
         assert baseline == fresh, [k for k in baseline if baseline[k] != fresh[k]]
         grafana = next(o for o in rendered if o["kind"] == "Secret" and o["metadata"]["name"] == "prometheus-grafana")
         assert grafana["data"]["admin-password"] == marker
-        assert len(a.release_docs(first)) == 129 and len(first["hooks"]) == 12
+        assert len(a.release_docs(first)) == reviewed_objects and len(first["hooks"]) == 12
         assert a.history("oci-monitoring")[0][0]["revision"] == 6
     # Exercise schema/defaulting for each actual non-hook RBAC body.
     observed = {}
@@ -142,7 +147,18 @@ def monitoring_lookup(root, config, kubectl, kube, apply, package):
         assert bool(stored["metadata"]["uid"])
         ordinary_rbac.append(obj)
     shapes = {k: v for k, v in observed.items() if v}
-    assert shapes == {"rbac.authorization.k8s.io/v1:Role:default:prometheus-grafana": {"rules": ["list", "NoneType"]}}
+    # The API stores an empty rule list as null, and check_live_rbac accepts exactly that.
+    # Nothing else may differ. Chart 82 rendered one such Role; chart 93 renders none.
+    empty = {a.identity(obj, "default") for obj in ordinary_rbac if obj.get("rules") == []}
+    assert shapes == {ident: {"rules": ["list", "NoneType"]} for ident in empty}
+    # Keep that API behaviour covered when no chart object has an empty rule list.
+    synthetic = {"apiVersion": group + "/v1", "kind": "Role", "rules": [],
+                 "metadata": {"name": "fixture-empty-rule-list", "namespace": "default"}}
+    kube(["apply", "--server-side", "--field-manager=helm", "-f", "-"], body=json.dumps(synthetic))
+    persisted = json.loads(kube(["get", "Role", synthetic["metadata"]["name"], "-n", "default", "-o", "json"]).stdout)
+    assert persisted.get("rules") is None, "The API no longer stores an empty rule list as null"
+    a.check_live_rbac(synthetic, persisted)
+    kube(["delete", "Role", synthetic["metadata"]["name"], "-n", "default"])
     narrow = "fixture-ordinary-rbac-reader-writer"
     for scope in ("Role", "ClusterRole"):
         names = [o for o in ordinary_rbac if o["kind"].startswith("Cluster") == (scope == "ClusterRole")]

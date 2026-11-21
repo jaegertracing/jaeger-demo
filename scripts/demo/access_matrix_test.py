@@ -82,7 +82,7 @@ class AccessMatrixTests(unittest.TestCase):
         status, out, err = self.run_main(renders_from_matrix())
         self.assertEqual((0, ""), (status, err))
         self.assertIn("Every rendered object has a reviewed record.", out)
-        self.assertIn("  oci-monitoring: 129 chart objects, 2 supplemental", out)
+        self.assertIn("  oci-monitoring: 128 chart objects, 2 supplemental", out)
         self.assertNotIn("no reviewed record", out)
         self.assertNotIn("match no rendered object", out)
 

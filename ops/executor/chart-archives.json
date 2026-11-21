@@ -1,6 +1,6 @@
 {
   "charts": {
-    "kube-prometheus-stack-82.10.4.tgz": "e0c601a95d333616fd30961ec9374893fba2b6852ce7df87f97f9efdd2cb9b41",
+    "kube-prometheus-stack-93.6.1.tgz": "6e2a81882b4883858470952b0a02366aac906dc253bf1057360f82526597fde4",
     "opensearch-3.7.0.tgz": "987e1b10fc717bee1545996c204c08a606d29bbab6b057e469923a92e7983c30",
     "opensearch-dashboards-3.7.0.tgz": "bf878bfdb1004879ccac2212fe9ed6c6884de1c44cec16fc84942c3c3d515b9c",
     "opentelemetry-demo-0.40.9.tgz": "33a381a62b2f8c6031cdee2935103877a5958af14a1f5d985d39602b53e6e07b"

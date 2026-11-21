@@ -61,7 +61,7 @@ against the embedded hook archive by the live adapter.
 [Offline six-chart receipt](all-five-candidates.json)
 
 Add `--frozen-transaction` to the private history rehearsal to run the signed
-post-renderer with a restricted writer. Add `--monitoring-lookup /path/to/kube-prometheus-stack-82.10.4.tgz`
+post-renderer with a restricted writer. Add `--monitoring-lookup /path/to/kube-prometheus-stack-93.6.1.tgz`
 to seed the chart CRDs and a synthetic Grafana Secret, then exercise its actual
 server-side dry-run using a read-only local identity.
 

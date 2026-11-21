@@ -17,12 +17,26 @@ crds:
 prometheusOperator:
   admissionWebhooks:
     patch:
+      # Keep the existing Opaque certificate Secret. The chart default,
+      # kubernetes.io/tls, makes the certificate job delete and recreate that
+      # Secret and gives its Role a delete rule, which the daily executor's
+      # reviewed hook grants do not cover.
+      secretType: ""
       image:
         # renovate: datasource=docker depName=ghcr.io/jkroepke/kube-webhook-certgen
-        tag: "1.7.8@sha256:e024de71cd416a44edef241519efd7489bf963425578fcb89aa5542b6950c91f"
+        tag: "1.11.1@sha256:8009b04f9873f7279b5adee37fdd03b6a9aa7b6751d4f69fde2683010e41cd1f"
 
 fullnameOverride: ""
 prometheus:
+  # The control-plane ServiceMonitors read the Prometheus pod's projected
+  # token through this scrape class, as they did through bearerTokenFile
+  # before. The chart's alternative is a service-account-token Secret, whose
+  # data Kubernetes fills in after creation. The daily executor requires a
+  # chart-owned Secret to equal its rendered data, so that Secret is not created.
+  controlPlaneScrapeClass:
+    enabled: true
+  serviceAccount:
+    createTokenSecret: false
   prometheusSpec:
     enableAdminAPI: true
     additionalScrapeConfigs: |
@@ -33,6 +47,9 @@ prometheus:
 
 
 grafana:
+  # The daily executor reviews exactly twelve hooks. Helm test hooks are not among them.
+  testFramework:
+    enabled: false
   # Allow index creation and plugin installation to finish before liveness checks.
   livenessProbe:
     initialDelaySeconds: 600

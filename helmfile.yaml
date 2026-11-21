@@ -19,7 +19,7 @@ releases:
     namespace: default
     labels: {stack: oci, component: monitoring}
     chart: prometheus-community/kube-prometheus-stack
-    version: "82.10.4"
+    version: "93.6.1"
     timeout: 1200
     values:
       - examples/oci/monitoring-values.yaml

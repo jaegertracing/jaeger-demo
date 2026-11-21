@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import json
 from pathlib import Path
+import subprocess
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ops/executor"))
 import manual_upgrade as m  # noqa: E402
@@ -181,6 +184,38 @@ class ManualUpgradeTests(unittest.TestCase):
             m.pins(self.pinned[1:], policies)
         with self.assertRaisesRegex(ValueError, "outside the reviewed access matrix"):
             m.pins(self.pinned + self.pinned[:1], policies)
+
+    def test_server_defaults_keep_objects_the_chart_places_outside_the_release_namespace(self):
+        service = next(o for o in self.pinned if o["kind"] == "Service" and o["metadata"]["namespace"] == "kube-system")
+        role = next(o for o in self.pinned if o["kind"] == "ClusterRole")
+        bare = copy.deepcopy(next(o for o in self.pinned if o["kind"] == "Deployment"))
+        release_namespace = bare["metadata"].pop("namespace")
+        trials = []
+
+        def admit(argv, *, input, **_):
+            trial = json.loads(input)
+            trials.append(trial)
+            trial["metadata"]["uid"] = UID
+            return subprocess.CompletedProcess(argv, 0, json.dumps(trial).encode(), b"")
+
+        with mock.patch.object(m.subprocess, "run", side_effect=admit):
+            admitted = m.server_defaults([(service, "default"), (role, "default"), (bare, release_namespace)], ["kubectl"])
+        self.assertEqual([m.ident(o) for o in admitted], [m.ident(service), m.ident(role), m.ident(bare, release_namespace)])
+        self.assertEqual(admitted[0]["metadata"]["namespace"], "kube-system")
+        self.assertNotIn("namespace", admitted[1]["metadata"])
+        self.assertTrue(all(t["metadata"]["name"].startswith("review-") for t in trials))
+        with mock.patch.object(m.subprocess, "run", side_effect=admit):
+            # The CI failure: every monitoring object arrives paired with its release namespace.
+            everything = m.server_defaults([(o, "default") for o in self.pinned], ["kubectl"])
+        self.assertTrue(m.pins(everything, m.policy_builder(USER)))
+
+        def moved(argv, *, input, **_):
+            trial = json.loads(input)
+            trial["metadata"]["namespace"] = "default"
+            return subprocess.CompletedProcess(argv, 0, json.dumps(trial).encode(), b"")
+
+        with mock.patch.object(m.subprocess, "run", side_effect=moved), self.assertRaisesRegex(ValueError, "changed namespace"):
+            m.server_defaults([(service, "default")], ["kubectl"])
 
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):

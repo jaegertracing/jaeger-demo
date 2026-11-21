@@ -270,9 +270,9 @@ def server_defaults(objects, kube):
             raise RuntimeError("Server dry-run failed for " + obj["kind"] + "/" + obj["metadata"]["name"])
         admitted = json.loads(completed.stdout)
         r.require(admitted["kind"] == obj["kind"] and admitted["metadata"]["name"] == trial["metadata"]["name"], "Unexpected admitted object")
+        # Charts may place objects outside the release namespace (kube-system Services), so keep the trial's namespace.
+        r.require(admitted["metadata"].get("namespace") == trial["metadata"].get("namespace"), "Admitted object changed namespace")
         admitted["metadata"]["name"] = obj["metadata"]["name"]
-        if "namespace" in admitted["metadata"]:
-            admitted["metadata"]["namespace"] = namespace
         result.append(admitted)
     return result
 

@@ -30,7 +30,8 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   upgrades. Admission policies require a manual deployment lock and pin every
   privileged field to the reviewed render; operators install it per commit, as
   described in `docs/manual-upgrade-access.md`.
-  (refs [#87](https://github.com/jaegertracing/jaeger-demo/issues/87))
+  ([#90](https://github.com/jaegertracing/jaeger-demo/pull/90),
+  refs [#87](https://github.com/jaegertracing/jaeger-demo/issues/87))
 - `Changelog entry` CI check: a pull request that changes a non-test file fails
   without a new dated entry unless a maintainer applies the `skip-changelog` label.
   It also validates the changelog's date and category headings.

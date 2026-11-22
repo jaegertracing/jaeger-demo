@@ -48,8 +48,14 @@ def install_operator_crds(archive, kube, scratch):
                 target = Path(scratch) / Path(member.name).name
                 target.write_bytes(bundle.extractfile(member).read())
                 kube(["create", "-f", str(target)], timeout=90)
+    # `kubectl wait` errors rather than waits when it reads a CRD before the API server has set any condition.
+    established = '{.status.conditions[?(@.type=="Established")].status}'
     for crd in ("prometheuses", "alertmanagers"):
-        kube(["wait", "--for=condition=Established", "crd/" + crd + ".monitoring.coreos.com", "--timeout=60s"], timeout=70)
+        name = "crd/" + crd + ".monitoring.coreos.com"
+        result = eventually(lambda: kube(["get", name, "-o", "jsonpath=" + established], check=False),
+                            lambda found: found.stdout.strip() == "True", seconds=60)
+        if result.stdout.strip() != "True":
+            raise ValueError(name + " is not Established")
 
 
 def live(obj):

@@ -246,6 +246,8 @@ def exercise(component, charts, cluster, scratch, apply="server"):
         before = {spec["release"]: status(cluster, spec) for spec in COMMANDS[component]["releases"]}
         require(all(s == "deployed" for s, _ in before.values()), "Baseline install failed")
         volumes = claims(cluster) if component == "opensearch" else {}
+        require(component != "opensearch" or (volumes and all(volume for _, volume in volumes.values())),
+                "The OpenSearch baseline has no bound data claim to preserve")
 
         built = m.render(USER, charts, cluster.kubeconfig, cluster.context, scratch)
         changes = built["changes"]
@@ -281,7 +283,7 @@ def exercise(component, charts, cluster, scratch, apply="server"):
             require(state == "deployed" and revision == before[release][1] + 1, f"{release} is {state} at revision {revision}")
         require(all(exists(cluster, k) for k in changes["added"]), "An added object is missing after the upgrade")
         require(not any(exists(cluster, k) for k in changes["removed"]), "A dropped object survived the upgrade")
-        if volumes:
+        if component == "opensearch":
             require(claims(cluster) == volumes, "The OpenSearch claims or their bindings changed")
 
         # Without the manual lock the same upgrade is refused before anything is written.

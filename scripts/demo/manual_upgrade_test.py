@@ -178,8 +178,10 @@ class ManualUpgradeTests(unittest.TestCase):
                         self.assertTrue(any("UPDATE" in ops and ('/' + name + '"' in cond or '"' + name + '"' in cond)
                                             for ops, cond, _ in guarded), name)
                 if "escalate" in writes and names != [""]:
-                    # Escalation on an existing role is only safe with a rules pin for that exact role.
-                    pinned = [obj for ops, cond, obj in guarded if obj["metadata"]["name"].startswith(m.PREFIX + "-pin-")]
+                    # Escalation on a role is only safe with a rules pin for that exact role, or, for a hook role,
+                    # its exact-content policy on both CREATE and UPDATE.
+                    pinned = [obj for ops, cond, obj in guarded if obj["metadata"]["name"].startswith(m.PREFIX + "-pin-")
+                              or (obj["spec"]["validations"][-1]["message"] == m.HOOK_DENIED and {"CREATE", "UPDATE"} <= set(ops))]
                     for name in names:
                         self.assertTrue(any('request.name == "' + name + '"' in obj["spec"]["matchConditions"][1]["expression"]
                                             for obj in pinned), name)
@@ -583,6 +585,9 @@ class ManualUpgradeTests(unittest.TestCase):
         patched = {n for _, rule in rules_of(self.grants) if "patch" in rule["verbs"] and set(rule.get("resourceNames", [])) <= names
                    for n in rule.get("resourceNames", [])}
         self.assertEqual(patched, names)
+        roles = {h["metadata"]["name"] for h in self.hooks if h["kind"] in ("Role", "ClusterRole")}
+        escalated = {n for _, rule in rules_of(self.grants) if "escalate" in rule["verbs"] for n in rule.get("resourceNames", [])}
+        self.assertLessEqual(roles, escalated)
         executor_guards, executor_grants = hooks.controls(self.hooks)
         self.assertFalse(any("patch" in rule["verbs"] for o in executor_grants if "rules" in o for rule in o["rules"]))
 
@@ -618,7 +623,8 @@ class ManualUpgradeTests(unittest.TestCase):
                 "client": {"metadata": {"managedFields": [{"manager": "helm", "operation": "Update"}]}}}
         self.assertEqual(m.apply_manager(live["helm"]), "helm")
         self.assertIsNone(m.apply_manager(live["client"]))
-        self.assertEqual(m.apply_manager({"metadata": {"managedFields": [{"manager": "other", "operation": "Apply"}]}}), "other")
+        self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "other", "operation": "Apply"}]}}))
+        self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply", "subresource": "status"}]}}))
         objects = [o for o in self.pinned if o["kind"] == "Deployment"][:3]
         modes = dict(zip((o["metadata"]["name"] for o in objects), ("helm", "client", None)))
         calls = []

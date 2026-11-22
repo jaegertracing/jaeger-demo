@@ -453,10 +453,15 @@ def server_defaults(objects, kube):
     return result
 
 
+HELM_MANAGER = "helm"
+
+
 def apply_manager(live):
-    """The field manager that last server-side applied a live object, or None for a client-side release."""
-    managers = sorted({f["manager"] for f in live["metadata"].get("managedFields") or [] if f.get("operation") == "Apply"})
-    return ("helm" if "helm" in managers else managers[0]) if managers else None
+    """Helm's field manager if Helm last server-side applied the object itself, else None. Other actors apply too,
+    such as the operator on a resource's status subresource, and do not make the release server-side."""
+    applied = {f["manager"] for f in live["metadata"].get("managedFields") or []
+               if f.get("operation") == "Apply" and not f.get("subresource")}
+    return HELM_MANAGER if HELM_MANAGER in applied else None
 
 
 def server_applied(objects, kube):

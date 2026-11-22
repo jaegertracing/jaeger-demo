@@ -131,7 +131,10 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
         tag = prefix + "-hook-" + hashlib.sha256((kind + "/" + name).encode()).hexdigest()[:16]
         predicate = "request.name == " + json.dumps(name) + (" && request.namespace == 'default'" if scope != "cluster" else "")
         match = [{"name": "records", "expression": "request.operation == 'DELETE' ? [oldObject] : [object]"}]
-        policy, binding = policies(tag, group, target, ["CREATE","DELETE"], "variables.records.all(s, " + exact + ")",
+        # Helm 4 creates hooks with server-side apply when the release uses it: a PATCH that the manual package
+        # grants by name, so there an update must match the reviewed hook exactly too.
+        operations = ["CREATE", "UPDATE", "DELETE"] if scoped else ["CREATE","DELETE"]
+        policy, binding = policies(tag, group, target, operations, "variables.records.all(s, " + exact + ")",
                                    "Hook differs from the independently reviewed monitoring baseline", condition=predicate, variables=match)
         if kind == "ConfigMap":
             # The separate inventory gate below also requires a running protected request
@@ -156,7 +159,7 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
         if lock:
             guards.extend(lock(prefix + "-hook-holder-" + target, group, target, ["CREATE", "DELETE"], None))
         grant_rules[scope].append(r.rule(group, target, ["create"]))
-        grant_rules[scope].append(r.rule(group, target, ["get","delete"], names))
+        grant_rules[scope].append(r.rule(group, target, ["delete", "get", "patch"] if scoped else ["get","delete"], names))
         if target in {"roles","clusterroles"}:
             grant_rules[scope].append(r.rule(group, target, ["bind"], names))
             # Kubernetes checks escalation for a CREATE against the collection URL, which has

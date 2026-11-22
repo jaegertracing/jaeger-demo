@@ -573,6 +573,68 @@ class ManualUpgradeTests(unittest.TestCase):
                          and spec["matchConstraints"]["resourceRules"][0]["resources"] == ["secrets"]]
                 self.assertFalse(any('"default/prometheus-grafana"' in c["expression"] for g in gates for c in g["matchConditions"]))
 
+    def test_server_side_applied_hooks_need_an_exact_update_too(self):
+        hook_policies = [g["spec"] for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy"
+                         and g["spec"]["validations"][-1]["message"] == m.HOOK_DENIED]
+        self.assertEqual(len(hook_policies), len(self.hooks))
+        self.assertTrue(all(spec["matchConstraints"]["resourceRules"][0]["operations"] == ["CREATE", "UPDATE", "DELETE"]
+                            for spec in hook_policies))
+        names = {h["metadata"]["name"] for h in self.hooks}
+        patched = {n for _, rule in rules_of(self.grants) if "patch" in rule["verbs"] and set(rule.get("resourceNames", [])) <= names
+                   for n in rule.get("resourceNames", [])}
+        self.assertEqual(patched, names)
+        executor_guards, executor_grants = hooks.controls(self.hooks)
+        self.assertFalse(any("patch" in rule["verbs"] for o in executor_grants if "rules" in o for rule in o["rules"]))
+
+    def test_pins_also_accept_the_server_side_applied_form(self):
+        deployment = next(o for o in self.pinned if o["kind"] == "Deployment")
+        reordered = copy.deepcopy(deployment)
+        reordered["spec"]["template"]["spec"]["containers"][0]["env"] = [{"name": "B", "value": "2"}, {"name": "A", "value": "1"}]
+        plain = m.surface_expression(deployment)
+        self.assertEqual(m.surface_expression(deployment, applied=copy.deepcopy(deployment)), plain)
+        both = m.surface_expression(deployment, applied=reordered)
+        self.assertIn('"name":dyn("B")', both.replace(" ", ""))
+        self.assertIn(m.take_expression(deployment), both)
+        self.assertIn(m.take_expression(reordered), both)
+        guards = m.pins(self.pinned, m.policy_builder(USER), applied={m.ident(deployment): reordered})
+        self.assertTrue(any(m.take_expression(reordered) in g["spec"]["validations"][1]["expression"]
+                            for g in guards if g["kind"] == "ValidatingAdmissionPolicy"))
+
+    def test_server_side_apply_dry_runs_only_objects_a_manager_applied(self):
+        live = {"helm": {"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply"},
+                                                        {"manager": "kube-controller-manager", "operation": "Update"}]}},
+                "client": {"metadata": {"managedFields": [{"manager": "helm", "operation": "Update"}]}}}
+        self.assertEqual(m.apply_manager(live["helm"]), "helm")
+        self.assertIsNone(m.apply_manager(live["client"]))
+        self.assertEqual(m.apply_manager({"metadata": {"managedFields": [{"manager": "other", "operation": "Apply"}]}}), "other")
+        objects = [o for o in self.pinned if o["kind"] == "Deployment"][:3]
+        modes = dict(zip((o["metadata"]["name"] for o in objects), ("helm", "client", None)))
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append(argv)
+            if "get" in argv:
+                mode = modes[argv[argv.index("get") + 2]]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(live[mode]).encode() if mode else b"", b"")
+            body = json.loads(kw["input"])
+            body["metadata"]["uid"] = UID
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body).encode(), b"")
+
+        with mock.patch.object(m.subprocess, "run", side_effect=fake):
+            applied = m.server_applied([(o, o["metadata"]["namespace"]) for o in objects], ["kubectl"])
+        self.assertEqual(list(applied), [m.ident(objects[0])])
+        apply_calls = [c for c in calls if "apply" in c]
+        self.assertEqual(len(apply_calls), 1)
+        for flag in ("--server-side", "--dry-run=server", "--field-manager=helm"):
+            self.assertIn(flag, apply_calls[0])
+
+    def test_added_objects_can_be_created_by_server_side_apply(self):
+        changes, _ = self.changed()
+        _, grants = m.package(USER, self.pinned, self.hooks, changes)
+        deployment = next(k for k in changes["added"] if k[2] == "deployments")
+        self.assertIn({"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["patch"], "resourceNames": [deployment[3]]},
+                      [rule for scope, rule in rules_of(grants) if scope == "otel-demo"])
+
     def test_executor_output_is_byte_identical_to_main(self):
         found = {"reads": digest(p.read_access()), "history-guard": digest(p.history_guard()), "history-grants": digest(p.history_grants())}
         found["routine-guards"], found["routine-grants"] = map(digest, p.regular())

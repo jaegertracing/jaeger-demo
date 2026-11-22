@@ -452,7 +452,7 @@ class ManualUpgradeTests(unittest.TestCase):
         removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired"),
                    ("default", "", "secrets", "fixture-retired")]
         changes = m.release_changes(set(steady) - set(added) | set(removed))
-        self.assertEqual(changes, {"added": added, "removed": sorted(removed)})
+        self.assertEqual(changes, {"added": added, "removed": sorted(removed), "retained": []})
         kinds = {(k[1], k[2]): HOOK_KINDS.get((k[1], k[2])) or m.PINNED.get((k[1], k[2])) for k in added}
         kinds.update({("", "configmaps"): "ConfigMap", ("", "secrets"): "Secret"})
         bodies = {k: fixture_object(*k[:3], k[3], kinds[k[1], k[2]]) for k in added}
@@ -553,6 +553,31 @@ class ManualUpgradeTests(unittest.TestCase):
         with m.selected(["opensearch"]), self.assertRaisesRegex(ValueError, "hooks outside"):
             m.package(USER, [], self.hooks)
 
+    def test_records_kept_only_as_rollback_targets_get_no_rights_and_are_deleted(self):
+        """access_matrix.py keeps records of dropped objects while a rollback target needs them."""
+        steady = {k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement"}
+        role = next(k for k in sorted(steady) if k[2] == "clusterroles")
+        deployment = next(k for k in sorted(steady) if k[2] == "deployments")
+        retained = {role, deployment}
+        changes = m.release_changes(steady, steady - retained)
+        self.assertEqual(changes, {"added": [], "removed": sorted(retained), "retained": sorted(retained)})
+        pinned = [o for o in self.pinned if m.ident(o) not in retained]
+        guards, grants = m.package(USER, pinned, self.hooks, changes)
+        for scope, group, target, name in retained:
+            named = [rule for s, rule in rules_of(grants) if s == scope and rule["resources"] == [target] and name in rule.get("resourceNames", [])]
+            verbs = {verb for rule in named for verb in rule["verbs"]}
+            # Deleted by Helm; never patched or escalated. A rendered binding may still bind it under its own pin.
+            self.assertLessEqual({"delete", "get"}, verbs, name)
+            self.assertFalse(verbs & {"patch", "escalate", "create", "update"}, name)
+        probes = m.readiness_probes(pinned, self.hooks, changes, {})
+        gone = {(None if k[0] == "cluster" else k[0], m.resource_arg(k[1], k[2]), k[3]) for k in retained}
+        self.assertFalse([x for x in probes if x["verb"] == "patch" and (x["namespace"], x["resource"], x["name"]) in gone])
+        with self.assertRaisesRegex(ValueError, "without a reviewed record"):
+            m.release_changes(steady, steady | {("otel-demo", "", "configmaps", "fixture-unreviewed")})
+        # Without the narrowing, a retained privileged record would be granted patch and escalate with no pin.
+        with self.assertRaisesRegex(ValueError, "missing from the render"):
+            m.package(USER, pinned, self.hooks)
+
     def test_executor_output_is_byte_identical_to_main(self):
         found = {"reads": digest(p.read_access()), "history-guard": digest(p.history_guard()), "history-grants": digest(p.history_grants())}
         found["routine-guards"], found["routine-grants"] = map(digest, p.regular())
@@ -567,7 +592,7 @@ class ManualUpgradeTests(unittest.TestCase):
         dashboard = next(k for k in sorted(steady) if k[:3] == ("default", "", "configmaps"))
         dropped = {("default", m.RBAC_GROUP, "roles", "fixture-grafana"), ("default", m.RBAC_GROUP, "rolebindings", "fixture-grafana")}
         changes = m.release_changes(steady - {dashboard} | dropped)
-        self.assertEqual(changes, {"added": [dashboard], "removed": sorted(dropped)})
+        self.assertEqual(changes, {"added": [dashboard], "removed": sorted(dropped), "retained": []})
         guards, grants = m.package(USER, self.pinned, self.hooks, changes)
         policies = {g["metadata"]["name"]: g["spec"] for g in guards if g["kind"] == "ValidatingAdmissionPolicy"}
         create_side, delete_side = policies[m.PREFIX + "-hook-inventory-configmaps"]["validations"][-1]["expression"].split(" : ", 1)

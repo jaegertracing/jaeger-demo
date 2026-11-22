@@ -86,7 +86,7 @@ KINDS = {**{kind: gvr for gvr, kind in r.GVR.items() if kind in SURFACE}, **OPER
 PINNED = {gvr: kind for kind, gvr in KINDS.items()}
 MAX_EXPRESSION = 48000
 # An upgrade that keeps every object needs no create or delete beyond hooks and history.
-NO_CHANGES = {"added": [], "removed": []}
+NO_CHANGES = {"added": [], "removed": [], "retained": []}
 
 
 @contextlib.contextmanager
@@ -154,6 +154,13 @@ def records():
     return rows
 
 
+def current(changes=NO_CHANGES):
+    """The reviewed records this commit's charts render. The matrix keeps records of dropped objects while a
+    rollback target needs them (access_matrix.py); those get no grant, pin or lock gate here."""
+    retained = {tuple(k) for k in changes.get("retained", ())}
+    return {key: row for key, row in records().items() if key not in retained}
+
+
 def ident(obj, default_namespace=None):
     group, target = KINDS[obj["kind"]]
     scope = "cluster" if obj["kind"].startswith("Cluster") or obj["kind"] in WEBHOOKS else obj["metadata"].get("namespace", default_namespace)
@@ -211,9 +218,9 @@ def surface_expression(reviewed, *, created=False):
     return expression
 
 
-def pins(defaulted, policies, added=()):
+def pins(defaulted, policies, added=(), rows=None):
     """One UPDATE policy per pinned object, which also covers CREATE for an object this commit adds."""
-    rows = records()
+    rows = records() if rows is None else rows
     expected = {key for key, row in rows.items() if (key[1], key[2]) in PINNED and not row.get("hookEvents")}
     seen = set()
     guards = []
@@ -277,18 +284,22 @@ def by_target(keys):
     return grouped
 
 
-def release_changes(deployed):
-    """Objects of the four releases' deployed manifests (hooks excluded) against this commit's reviewed render:
-    what the upgrade creates and what Helm deletes. Supplements are applied outside Helm and never counted."""
+def release_changes(deployed, rendered=None):
+    """Objects of the releases' deployed manifests (hooks excluded) against this commit's render: what the
+    upgrade creates, what Helm deletes, and the reviewed records kept only as rollback targets. Supplements are
+    applied outside Helm and never counted. Without `rendered`, every reviewed record counts as rendered."""
     rows = records()
-    rendered = {k for k, row in rows.items() if not row.get("hookEvents") and row["release"] != "supplement"}
+    reviewed = {k for k, row in rows.items() if not row.get("hookEvents") and row["release"] != "supplement"}
+    rendered = reviewed if rendered is None else {tuple(k) for k in rendered}
+    unreviewed = sorted(rendered - reviewed)
+    r.require(not unreviewed, "Rendered objects without a reviewed record: " + ", ".join("/".join(k) for k in unreviewed))
     deployed = {tuple(k) for k in deployed}
     kinds = {(k[1], k[2]) for k in rows}
     removed = deployed - rendered
     for key in sorted(removed):
         r.require((key[1], key[2]) in kinds and key[0] in NAMESPACES + ("kube-system", "cluster"),
                   "Removing this deployed object needs an operator: " + "/".join(key))
-    return {"added": sorted(rendered - deployed), "removed": sorted(removed)}
+    return {"added": sorted(rendered - deployed), "removed": sorted(removed), "retained": sorted(reviewed - rendered)}
 
 
 def change_gates(changes, policies, hook_names):
@@ -321,7 +332,7 @@ def create_targets(changes, hook_names):
 
 
 def grants(defaulted, subjects, changes=NO_CHANGES):
-    rows = records()
+    rows = current(changes)
     rules = defaultdict(list)
     for (scope, group, target), names in sorted(ordinary(rows).items()):
         rules[scope].append(r.rule(group, target, ["get", "patch"], names))
@@ -366,7 +377,8 @@ def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
     subjects = subjects_for(user)
     policies = policy_builder(user)
     hook_names = hook_targets(defaulted_hooks)
-    guards = (pins(defaulted, policies, set(map(tuple, changes["added"]))) + lock_gates(records(), policies)
+    rows = current(changes)
+    guards = (pins(defaulted, policies, set(map(tuple, changes["added"])), rows) + lock_gates(rows, policies)
               + history(policies, changes) + change_gates(changes, policies, hook_names))
     hook_guards, hook_grants = [], []
     if "oci-monitoring" in COMPONENTS:
@@ -576,7 +588,7 @@ def readiness_probes(defaulted, definitions, changes=NO_CHANGES, bodies=None):
         secret = r.resource("v1", "Secret", PROBE, namespace, stringData={"probe": "true"})
         probes.append({"phase": "held", "label": f"history {namespace}", "verb": "create", "namespace": None,
                        "body": secret, "expect": HISTORY_DENIED})
-    for (scope, group, target), names in sorted(ordinary(records()).items()):
+    for (scope, group, target), names in sorted(ordinary(current(changes)).items()):
         existing = sorted(n for n in names if (scope, group, target, n) not in added)
         if not existing:
             continue
@@ -609,7 +621,7 @@ def render(user, charts, kubeconfig, context, scratch):
     probes, the objects the upgrade adds and drops, and the archive digests."""
     kube = ["kubectl", "--kubeconfig", kubeconfig, "--context", context, "--request-timeout=15s"]
     pinned, located, rendered = render_pinned(charts, scratch)
-    changes = release_changes(deployed_objects(kubeconfig, context, scratch))
+    changes = release_changes(deployed_objects(kubeconfig, context, scratch), rendered)
     defaulted = server_defaults(pinned, kube)
     definitions = hooks.pinned_hooks(located["oci-monitoring"]) if "oci-monitoring" in COMPONENTS else []
     defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
@@ -651,6 +663,7 @@ def main():
                "chartArchiveSHA256": built["archives"], "pinnedObjects": built["pinnedObjects"], "hooks": built["hooks"],
                "guards": len(built["guards"]), "grants": len(built["grants"]), "probes": len(built["probes"]),
                "added": ["/".join(k) for k in changes["added"]], "removed": ["/".join(k) for k in changes["removed"]],
+               "retained": ["/".join(k) for k in changes["retained"]],
                "order": "Apply guards.json, then grants.json. Remove grants.json before guards.json."}
     for name in ("guards", "grants"):
         (args.output / (name + ".json")).write_bytes(adapter.encode({"apiVersion": "v1", "kind": "List", "items": built[name]}))

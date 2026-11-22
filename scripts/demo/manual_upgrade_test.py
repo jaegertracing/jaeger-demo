@@ -557,6 +557,22 @@ class ManualUpgradeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing from the render"):
             m.package(USER, pinned, self.hooks)
 
+    def test_a_dropped_chart_secret_keeps_the_history_check(self):
+        steady = {k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement"}
+        grafana = ("default", "", "secrets", "prometheus-grafana")
+        self.assertIn("prometheus-grafana", p.MONITORING_SECRETS)
+        self.assertEqual(m.chart_secrets(), p.MONITORING_SECRETS)
+        for changes in (m.release_changes(steady, steady - {grafana}), m.release_changes(steady - {grafana}, steady - {grafana})):
+            with self.subTest(deployed=grafana in changes["removed"]):
+                self.assertIn(grafana, changes["retained"])
+                guards, _ = m.package(USER, self.pinned, self.hooks, changes)
+                policies = {g["metadata"]["name"]: g["spec"] for g in guards if g["kind"] == "ValidatingAdmissionPolicy"}
+                condition = [c["expression"] for c in policies[m.PREFIX + "-history"]["matchConditions"]][1]
+                self.assertEqual(condition, p.CHART_SECRET_UPDATE + json.dumps([n for n in p.MONITORING_SECRETS if n != "prometheus-grafana"]) + ")")
+                gates = [spec for name, spec in policies.items() if name.startswith(m.PREFIX + "-lock-")
+                         and spec["matchConstraints"]["resourceRules"][0]["resources"] == ["secrets"]]
+                self.assertFalse(any('"default/prometheus-grafana"' in c["expression"] for g in gates for c in g["matchConditions"]))
+
     def test_executor_output_is_byte_identical_to_main(self):
         found = {"reads": digest(p.read_access()), "history-guard": digest(p.history_guard()), "history-grants": digest(p.history_grants())}
         found["routine-guards"], found["routine-grants"] = map(digest, p.regular())

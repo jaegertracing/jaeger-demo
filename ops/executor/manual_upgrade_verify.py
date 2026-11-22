@@ -31,13 +31,22 @@ import permissions as r  # noqa: E402
 PHASES = ("unlocked", "held")
 
 
-def contains(expected, actual):
-    """Every field the package set is present unchanged; the API server may add defaults."""
-    if isinstance(expected, dict):
-        return isinstance(actual, dict) and all(k in actual and contains(v, actual[k]) for k, v in expected.items())
-    if isinstance(expected, list):
-        return isinstance(actual, list) and len(expected) == len(actual) and all(map(contains, expected, actual))
-    return expected == actual
+# Fields the API server defaults on admission policies and bindings, at these values only.
+SERVER_DEFAULTS = {"matchPolicy": "Equivalent", "namespaceSelector": {}, "objectSelector": {}, "scope": "*"}
+
+
+def without_defaults(value):
+    if isinstance(value, dict):
+        return {k: without_defaults(v) for k, v in value.items() if not (k in SERVER_DEFAULTS and v == SERVER_DEFAULTS[k])}
+    if isinstance(value, list):
+        return [without_defaults(v) for v in value]
+    return value
+
+
+def matches(expected, actual):
+    """The installed spec equals guards.json apart from the server's defaults. Anything else, such as a selector
+    that narrows which requests a policy sees, is a difference."""
+    return without_defaults(expected) == without_defaults(actual)
 
 
 def installed(guards, kube):
@@ -54,7 +63,7 @@ def installed(guards, kube):
             r.require(found.get("binaryData") == item["binaryData"] and found.get("immutable") is True, "Hook archive differs: " + key[1])
             continue
         r.require(key in live, "Guard not installed: " + "/".join(key))
-        r.require(contains(item["spec"], live[key]["spec"]), "Installed guard differs from guards.json: " + "/".join(key))
+        r.require(matches(item["spec"], live[key]["spec"]), "Installed guard differs from guards.json: " + "/".join(key))
     return len(guards)
 
 

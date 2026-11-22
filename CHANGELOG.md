@@ -31,7 +31,8 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   recorded baselines, including an OTel demo upgrade that adds and drops objects.
   `ops/executor/manual_upgrade.py --components` renders the package for only the
   components an upgrade changes.
-  (refs [#87](https://github.com/jaegertracing/jaeger-demo/issues/87))
+  ([#93](https://github.com/jaegertracing/jaeger-demo/pull/93),
+  refs [#87](https://github.com/jaegertracing/jaeger-demo/issues/87))
 
 ## 2026-11-21
 

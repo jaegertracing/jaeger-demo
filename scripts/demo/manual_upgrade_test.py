@@ -673,6 +673,14 @@ class ManualUpgradeTests(unittest.TestCase):
         self.assertEqual(target["metadata"]["annotations"], {"meta.helm.sh/release-name": "prometheus", "meta.helm.sh/release-namespace": "default"})
         self.assertEqual(target["metadata"]["namespace"], "default")
 
+    def test_release_records_are_decompressed_within_the_limit(self):
+        inner = base64.b64encode(gzip.compress(b'{"pad":"' + b"a" * (m.adapter.LIMIT + 10) + b'"}'))
+        item = {"metadata": {"labels": {"version": "1"}}, "data": {"release": base64.b64encode(inner).decode()}}
+        with mock.patch.object(m, "RELEASE_KEYS", ("otel-demo",)), \
+                mock.patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps({"items": [item]}).encode(), b"")), \
+                self.assertRaisesRegex(ValueError, "Invalid compressed|Oversized"):
+            m.release_methods(["kubectl"])
+
     def test_release_methods_come_from_the_latest_helm_record(self):
         def record(version, method):
             body = {"name": "otel-demo", "version": version}

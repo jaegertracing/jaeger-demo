@@ -193,7 +193,7 @@ def pins(defaulted, policies):
         condition = r.REQUEST_NS + " == " + json.dumps("" if scope == "cluster" else scope) + " && request.name == " + json.dumps(name)
         tag = PREFIX + "-pin-" + hashlib.sha256("/".join(key).encode()).hexdigest()[:16]
         guards += policies(tag, group, target, ["UPDATE"], surface_expression(obj),
-                           "Privileged fields differ from the reviewed render of this commit", condition=condition)
+                           PIN_DENIED, condition=condition)
     missing = sorted(expected - seen)
     r.require(not missing, "Reviewed privileged objects missing from the render: " + ", ".join("/".join(k) for k in missing))
     return guards
@@ -215,13 +215,13 @@ def lock_gates(rows, policies):
         prefix = "" if scope == "cluster" else scope
         condition = r.REQUEST_NS + ' + "/" + request.name in ' + json.dumps(sorted(prefix + "/" + n for n in names))
         name = PREFIX + "-lock-" + hashlib.sha256(f"{scope}/{group}/{target}".encode()).hexdigest()[:16]
-        guards += policies(name, group, target, ["UPDATE"], "true", "A manual deployment lock holder is required", condition=condition)
+        guards += policies(name, group, target, ["UPDATE"], "true", LOCK_DENIED, condition=condition)
     return guards
 
 
 def history(policies):
     guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], r.history_expression(HISTORY),
-                      "Only canonical Helm history records of the six releases may change",
+                      HISTORY_DENIED,
                       condition=r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")",
                       variables=[{"name": "records", "expression": r.HISTORY_RECORDS}])
     # The three chart-owned monitoring Secrets may change with the chart (documented residual risk);
@@ -348,6 +348,73 @@ def render_pinned(charts, scratch):
     return pinned, located
 
 
+PIN_DENIED = "Privileged fields differ from the reviewed render of this commit"
+LOCK_DENIED = "A manual deployment lock holder is required"
+HOOK_DENIED = "Hook differs from the independently reviewed monitoring baseline"
+INVENTORY_DENIED = "Only the twelve reviewed monitoring hooks may be created or deleted"
+HISTORY_DENIED = "Only canonical Helm history records of the six releases may change"
+PROBE = "jaeger-demo-readiness-probe"
+PROBE_LABEL = "jaegertracing.io/readiness-probe"
+
+
+def resource_arg(group, target):
+    return target + ("." + group if group else "")
+
+
+def pin_probe(obj):
+    """A dry-run patch that neither keeps nor takes the reviewed surface, so only this object's pin can deny it."""
+    kind = obj["kind"]
+    if kind in ("Role", "ClusterRole"):
+        rule = {"apiGroups": ["readiness.invalid"], "resources": ["probes"], "verbs": ["get"]}
+        return "merge", {"rules": (obj.get("rules") or []) + [rule]}
+    if kind.endswith("Binding"):
+        return "merge", {"subjects": (obj.get("subjects") or []) + [{"kind": "User", "apiGroup": RBAC_GROUP, "name": "readiness.invalid"}]}
+    if kind in ("Deployment", "DaemonSet", "StatefulSet"):
+        return "merge", {"spec": {"template": {"spec": {"terminationGracePeriodSeconds": 7919}}}}
+    if kind in OPERATOR_KINDS:
+        return "merge", {"spec": {"replicas": (obj["spec"].get("replicas") or 1) + 7}}
+    if kind == "Service":
+        return "merge", {"spec": {"externalIPs": ["192.0.2.10"]}}
+    timeout = obj["webhooks"][0].get("timeoutSeconds", 10)
+    return "json", [{"op": "replace", "path": "/webhooks/0/timeoutSeconds", "value": timeout % 30 + 1}]
+
+
+def readiness_probes(defaulted, definitions):
+    """probes.json for manual_upgrade_verify.py: one content probe per pin, hook, inventory target and
+    history namespace under a manual holder, and one lock probe per lock gate without one."""
+    probes = []
+    for obj in defaulted:
+        scope, group, target, name = ident(obj)
+        if obj["kind"] in WEBHOOKS and not obj.get("webhooks"):
+            continue
+        kind_of_patch, change = pin_probe(obj)
+        probes.append({"phase": "held", "label": f"pin {obj['kind']} {scope}/{name}", "verb": "patch", "resource": resource_arg(group, target),
+                       "namespace": None if scope == "cluster" else scope, "name": name, "type": kind_of_patch,
+                       "patch": change, "expect": PIN_DENIED})
+    first = {}
+    for hook in definitions:
+        changed = copy.deepcopy(hook)
+        changed["metadata"].setdefault("labels", {})[PROBE_LABEL] = "true"
+        probes.append({"phase": "held", "label": f"hook {hook['kind']} {hook['metadata']['name']}", "verb": "create",
+                       "namespace": None, "body": changed, "expect": HOOK_DENIED})
+        first.setdefault(hooks.KINDS[hook["kind"]], hook)
+    for (group, target), hook in sorted(first.items()):
+        stray = copy.deepcopy(hook)
+        stray["metadata"] = {k: v for k, v in hook["metadata"].items() if k in ("namespace", "labels", "annotations")}
+        stray["metadata"]["name"] = PROBE
+        probes.append({"phase": "held", "label": f"hook inventory {target}", "verb": "create", "namespace": None,
+                       "body": stray, "expect": INVENTORY_DENIED})
+    for namespace in NAMESPACES:
+        secret = r.resource("v1", "Secret", PROBE, namespace, stringData={"probe": "true"})
+        probes.append({"phase": "held", "label": f"history {namespace}", "verb": "create", "namespace": None,
+                       "body": secret, "expect": HISTORY_DENIED})
+    for (scope, group, target), names in sorted(ordinary(records()).items()):
+        probes.append({"phase": "unlocked", "label": f"lock {target} {scope}", "verb": "patch", "resource": resource_arg(group, target),
+                       "namespace": None if scope == "cluster" else scope, "name": sorted(names)[0], "type": "merge",
+                       "patch": {"metadata": {"labels": {PROBE_LABEL: "true"}}}, "expect": LOCK_DENIED})
+    return probes
+
+
 def clean_commit():
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
@@ -381,16 +448,19 @@ def main():
             charts = staging / "charts"
         pinned, located = render_pinned(charts, scratch)
         defaulted = server_defaults(pinned, kube)
-        defaulted_hooks = dry_admitted_hooks(hooks.pinned_hooks(located["oci-monitoring"]), kube)
+        definitions = hooks.pinned_hooks(located["oci-monitoring"])
+        defaulted_hooks = dry_admitted_hooks(definitions, kube)
         guards, granted = package(args.user, defaulted, defaulted_hooks)
+        probes = readiness_probes(defaulted, definitions)
         archives = {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}
     args.output.mkdir(mode=0o700)
     summary = {"configurationSHA": commit, "clusterUID": args.cluster_uid, "kubernetes": kube_version,
                "chartArchiveSHA256": archives, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
-               "guards": len(guards), "grants": len(granted),
+               "guards": len(guards), "grants": len(granted), "probes": len(probes),
                "order": "Apply guards.json, then grants.json. Remove grants.json before guards.json."}
     for name, items in (("guards", guards), ("grants", granted)):
         (args.output / (name + ".json")).write_bytes(adapter.encode({"apiVersion": "v1", "kind": "List", "items": items}))
+    (args.output / "probes.json").write_text(json.dumps(probes, indent=1) + "\n")
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 

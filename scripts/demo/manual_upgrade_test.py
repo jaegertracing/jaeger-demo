@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ops/executor"))
 import manual_upgrade as m  # noqa: E402
+import manual_upgrade_verify as verify  # noqa: E402
 import monitoring_hooks as hooks  # noqa: E402
 import permissions as p  # noqa: E402
 
@@ -306,6 +307,77 @@ class ManualUpgradeTests(unittest.TestCase):
             return hooks.controls(objects, policies=m.policy_builder(USER), lock=None, archive_name=m.ARCHIVE,
                                   prefix=m.PREFIX, account_guards=False, scoped=True)
         self.assertEqual(controls(admitted), controls(direct))
+
+    def test_readiness_probes_cover_every_guard_with_its_own_message(self):
+        probes = m.readiness_probes(self.pinned, self.hooks)
+        held = [x for x in probes if x["phase"] == "held"]
+        pins = [x for x in held if x["expect"] == m.PIN_DENIED]
+        self.assertEqual(sorted((x["namespace"] or "cluster", x["resource"], x["name"]) for x in pins),
+                         sorted((s_, m.resource_arg(g, t), n) for s_, g, t, n in map(m.ident, self.pinned)))
+        self.assertEqual(len([x for x in held if x["expect"] == m.HOOK_DENIED]), len(self.hooks))
+        self.assertEqual(len([x for x in held if x["expect"] == m.INVENTORY_DENIED]), len({hooks.KINDS[h["kind"]] for h in self.hooks}))
+        self.assertEqual(sorted(x["body"]["metadata"]["namespace"] for x in held if x["expect"] == m.HISTORY_DENIED), sorted(m.NAMESPACES))
+        locks = [x for x in probes if x["phase"] == "unlocked"]
+        self.assertEqual(len(locks), len(m.ordinary(m.records())))
+        self.assertTrue(all(x["expect"] == m.LOCK_DENIED for x in locks))
+        # Every message the probes expect is one the package actually emits.
+        messages = {v["message"] for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy" for v in g["spec"]["validations"]}
+        self.assertLessEqual({x["expect"] for x in probes}, messages)
+
+    def test_pin_probes_change_a_pinned_field(self):
+        def merge(target, change):
+            if not isinstance(change, dict) or not isinstance(target, dict):
+                return change
+            return {**target, **{k: merge(target.get(k), v) for k, v in change.items()}}
+        for obj in self.pinned:
+            kind_of_patch, change = m.pin_probe(obj)
+            patched = copy.deepcopy(obj)
+            if kind_of_patch == "merge":
+                patched = merge(patched, change)
+            else:
+                op, = change
+                patched["webhooks"][0]["timeoutSeconds"] = op["value"]
+            surface = m.SURFACE.get(obj["kind"], [(("webhooks",), [])])
+            with self.subTest(kind=obj["kind"], name=obj["metadata"]["name"]):
+                self.assertTrue(any(m.at(patched, path, d) != m.at(obj, path, d) for path, d in surface))
+
+    def test_verifier_requires_the_phase_holder_and_the_expected_denial(self):
+        probe = {"phase": "held", "label": "pin", "verb": "patch", "resource": "deployments.apps", "namespace": "default",
+                 "name": "x", "type": "merge", "patch": {}, "expect": m.PIN_DENIED}
+        calls = []
+
+        def cluster(holder_value, answers):
+            def fake(argv, **_):
+                if "configmap" in argv and p.CHECKPOINT in argv:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"metadata": {"annotations": {p.HOLDER: holder_value}}}).encode(), b"")
+                calls.append(argv)
+                code, err = answers.pop(0) if len(answers) > 1 else answers[0]
+                return subprocess.CompletedProcess(argv, code, "", err)
+            return fake
+
+        with mock.patch.object(verify.subprocess, "run", side_effect=cluster("manual/7/1", [(1, "lock"), (1, m.PIN_DENIED)])), \
+                mock.patch.object(verify.time, "sleep"):
+            self.assertEqual(verify.run([probe], "held", ["kubectl"], USER), ["pin"])
+        self.assertIn("--dry-run=server", calls[-1])
+        self.assertEqual(calls[-1][1:5], ["--as", USER, "--as-group", "system:authenticated"])
+        with mock.patch.object(verify.subprocess, "run", side_effect=cluster("daily/2026-11-22T13:00:00Z/x", [(1, m.PIN_DENIED)])), \
+                self.assertRaisesRegex(ValueError, "holder does not match"):
+            verify.run([probe], "held", ["kubectl"], USER)
+        with mock.patch.object(verify.subprocess, "run", side_effect=cluster("manual/7/1", [(0, "")])), \
+                mock.patch.object(verify.time, "sleep"), mock.patch.object(verify.time, "monotonic", side_effect=[0, 0, 999]), \
+                self.assertRaisesRegex(ValueError, "Not enforced: pin"):
+            verify.run([probe], "held", ["kubectl"], USER)
+
+    def test_installed_guards_must_match_guards_json(self):
+        policy = next(g for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy")
+        served = copy.deepcopy(policy)
+        served["spec"]["matchConstraints"]["matchPolicy"] = "Equivalent"
+        self.assertTrue(verify.contains(policy["spec"], served["spec"]))
+        served["spec"]["validations"][1]["expression"] = "true"
+        self.assertFalse(verify.contains(policy["spec"], served["spec"]))
+        served["spec"] = copy.deepcopy(policy["spec"])
+        served["spec"]["validations"].pop()
+        self.assertFalse(verify.contains(policy["spec"], served["spec"]))
 
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):

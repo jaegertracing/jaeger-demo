@@ -28,8 +28,9 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
 - `ops/executor/manual_upgrade.py` renders a guarded package that lets the
   `demo-apply` identity perform the manual monitoring, OpenSearch and OTel demo
   upgrades. Admission policies require a manual deployment lock and pin every
-  privileged field to the reviewed render; operators install it per commit, as
-  described in `docs/manual-upgrade-access.md`.
+  privileged field to the reviewed render; operators install it per commit and
+  prove enforcement with `ops/executor/manual_upgrade_verify.py` before approving
+  a run, as described in `docs/manual-upgrade-access.md`.
   ([#90](https://github.com/jaegertracing/jaeger-demo/pull/90),
   refs [#87](https://github.com/jaegertracing/jaeger-demo/issues/87))
 - `Changelog entry` CI check: a pull request that changes a non-test file fails

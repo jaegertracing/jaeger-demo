@@ -18,6 +18,7 @@ import time
 REPO = Path(__file__).resolve().parents[4]
 sys.path[:0] = [str(REPO / "ops/executor"), str(REPO / "scripts/demo")]
 import manual_upgrade as m  # noqa: E402
+import manual_upgrade_verify as verify  # noqa: E402
 import monitoring_hooks as hooks  # noqa: E402
 import permissions as r  # noqa: E402
 
@@ -99,6 +100,12 @@ def exercise(charts, kubectl, cfg, kube):
     for obj in defaulted:
         kube(["create", "-f", "-"], body=json.dumps(live(obj)))
     by_kind = {(o["kind"], o["metadata"]["name"]): o for o in defaulted}
+
+    # The operator's readiness check, as documented: every guard installed, then content-specific
+    # denials under a manual holder. Lock gates of kinds this fixture never creates are skipped below.
+    probes = m.readiness_probes(defaulted, definitions)
+    verify.installed(guards, admin)
+    readiness = verify.run(probes, "held", admin, USER)
 
     def user(args, body=None):
         return kube([*as_user, *args], body=body, check=False)
@@ -211,6 +218,8 @@ def exercise(charts, kubectl, cfg, kube):
         args = ["-n", "default", "annotate", "configmap", r.CHECKPOINT, "--overwrite"]
         kube(args + ([r.HOLDER + "=" + value] if value else [r.HOLDER + "-"]))
         expect_denied(name, eventually(touch, lambda result: result.returncode), LOCK)
+    present = {m.resource_arg(*m.KINDS[o["kind"]]) for o in defaulted}
+    readiness += verify.run([p for p in probes if p["phase"] == "held" or p["resource"] in present], "unlocked", admin, USER)
     kube(["-n", "default", "delete", "configmap", r.CHECKPOINT])
     if not eventually(touch, lambda result: result.returncode).returncode:
         raise ValueError("A write was admitted without the checkpoint parameter")
@@ -226,4 +235,4 @@ def exercise(charts, kubectl, cfg, kube):
             raise ValueError(f"The manual user may {verb} {target}")
         denied.append(f"RBAC: {verb} {target}")
     return {"pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks), "guards": len(guards), "grants": len(grants),
-            "allowed": allowed, "denied": denied, "controlPlaneOnly": True}
+            "allowed": allowed, "denied": denied, "readinessProbes": readiness, "controlPlaneOnly": True}

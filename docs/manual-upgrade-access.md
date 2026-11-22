@@ -30,6 +30,7 @@ renders two lists from the reviewed commit:
 | File | Contents |
 | --- | --- |
 | `guards.json` | ValidatingAdmissionPolicies that match only the `demo-apply` Kubernetes user, fail closed, and deny every write unless `default/jaeger-demo-deployment-revisions` is held by a manual run (`manual/<run>/<attempt>`). Each object that carries privilege must keep its current security surface or take exactly the one in this commit's server-defaulted render: Role and ClusterRole rules, ClusterRole labels (an `aggregationRule` such as `view`'s copies the rules of every ClusterRole whose labels it selects), binding subjects and role references, the pod spec of every Deployment, DaemonSet and StatefulSet, the `Prometheus` and `Alertmanager` specs the operator turns into pods, Service type, `externalIPs` and `externalName`, and admission webhooks apart from the rotated `caBundle`. A StatefulSet's storage identity (claim templates, PVC retention policy, selector, service name and replica count) must stay as it is, whatever the pod spec does, because a `Delete` retention policy with fewer replicas lets the controller delete data volumes. The twelve monitoring hooks must match the reviewed hooks exactly, as for the executor. Secret writes must be canonical Helm history records of the six releases, except the three chart-owned monitoring Secrets. |
+| `probes.json` | Server dry-run probes for `manual_upgrade_verify.py`, one per pin, hook, hook inventory target, history namespace and lock gate. |
 | `grants.json` | Roles bound to the same user: named `get,patch` on the reviewed matrix records of the three components, named `escalate` and `bind` on the chart's existing roles, the hook lifecycle verbs, history Secret writes in `default`, `opensearch` and `otel-demo`, and the reads Helm's `--wait` needs. No namespace, storage, CRD, exec or port-forward rights. |
 
 The executor's own policies match only its service account and a running daily
@@ -69,30 +70,44 @@ digests and the object counts. Review `grants.json` in full before installing it
 
 Admission policies and RBAC changes reach the API server asynchronously, so
 creating the guards first does not by itself prove they enforce before the grants
-do. Close that window procedurally, with the `demo-apply` environment reviewer as
-the gate:
+do. Lock-only gates also return the same lock message as the content pins, so a
+lock denial does not show that a pin is loaded.
+[`ops/executor/manual_upgrade_verify.py`](../ops/executor/manual_upgrade_verify.py)
+checks that every guard in `guards.json` is installed unchanged, then runs the
+server dry-run probes in `probes.json` as the user. Each probe must be denied with
+its own policy's message. Close the window procedurally, with the `demo-apply`
+environment reviewer as the gate:
 
 1. Confirm that no Deploy, OpenSearch recovery or volume expansion run is in
    progress or waiting for approval, and that `default/jaeger-demo-deployment-revisions`
    exists and is not held by a `manual/` run. Approve no `demo-apply` deployment
-   until step 5 passes.
+   until step 6 passes.
 2. Apply `guards.json` with `kubectl create -f`. The hook CRD archive is too large
    for a client-side apply annotation.
 3. Apply `grants.json`. Grants never go in before their guards.
-4. Prove enforcement while no manual run holds the lock. Every policy then denies,
-   so each of these server dry-runs as `--as "$demo_apply_user"` must fail with
-   `A manual deployment lock holder is required`: a label patch on ClusterRole
-   `prometheus-kube-prometheus-operator`, DaemonSet
-   `default/prometheus-prometheus-node-exporter`, StatefulSet
-   `opensearch/opensearch-cluster-single` and Deployment `otel-demo/frontend`, and a
-   create of the reviewed hook ClusterRole `prometheus-crds-upgrade`. Repeat until
-   all of them are denied; an admitted dry-run means a policy is not loaded yet.
-   Then check `kubectl auth can-i --list --as "$demo_apply_user"` in each namespace.
-5. Approve the manual upgrade from `main` at the same commit. The job takes the
-   deployment lock, which is what the policies check.
-6. For the next reviewed commit, repeat step 1, delete `grants.json`, then
+4. With no manual holder, run the verifier with `--phase unlocked`. Every lock gate
+   must deny a label patch.
+5. Set a controlled holder, for example
+   `kubectl -n default annotate configmap jaeger-demo-deployment-revisions jaegertracing.io/deployment-lock-holder=manual/0/0`,
+   outside the daily preparation and run (from 12:20 UTC until the 13:00 UTC run
+   finishes), and run the verifier with
+   `--phase held`. Every pin, hook, hook inventory target and history namespace
+   must deny its content probe. Then remove the annotation.
+6. Check `kubectl auth can-i --list --as "$demo_apply_user"` in each namespace,
+   then approve the manual upgrade from `main` at the same commit. The job takes
+   the deployment lock, which is what the policies check.
+7. For the next reviewed commit, repeat step 1, delete `grants.json`, then
    `guards.json`, and install the new package from step 2. To roll back to an
    earlier commit, render the package from that commit.
+
+```bash
+python3 ops/executor/manual_upgrade_verify.py --package "$review_directory" \
+  --user "$demo_apply_user" --kubeconfig "$operator_kubeconfig" --context "$context" \
+  --phase unlocked
+```
+
+The RBAC preservation policies for hook roles have no probe: they apply only while
+a hook role exists during a hook run.
 
 Removing the grants returns `demo-apply` to its Stage 1 scope.
 
@@ -140,7 +155,9 @@ binding to the user, a cluster-admin binding, arbitrary Secrets, an unreviewed
 ConfigMap in `default`, and every write without a manual lock or parameter. It
 admits metadata changes, a restored reviewed rule set, a webhook CA rotation, the
 reviewed hooks and canonical history records. It renders the package with a failed
-hook Job left in the cluster. With a stand-in for the Stage 1
+hook Job left in the cluster, and runs `manual_upgrade_verify.py` in both phases
+against the installed package, skipping lock gates of kinds the fixture never
+creates. With a stand-in for the Stage 1
 Roles, which are not in the repository, it also admits Jaeger history records in
 `default` and `jaeger` and a recovery ConfigMap in `opensearch`. A real Helm upgrade under these grants is a separate
 rehearsal.

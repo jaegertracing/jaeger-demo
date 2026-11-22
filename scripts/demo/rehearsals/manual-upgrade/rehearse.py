@@ -243,6 +243,19 @@ def explain(cluster, built, stderr, after=None):
     explain(cluster, built, stderr)
 
 
+def server_side_objects(cluster, built):
+    """Pinned objects whose live managed fields show Helm's own server-side apply, independent of the renderer."""
+    found = []
+    for obj in built["defaulted"]:
+        key = m.ident(obj)
+        args = (["-n", key[0]] if key[0] != "cluster" else []) + ["get", m.resource_arg(*key[1:3]), key[3], "--ignore-not-found",
+                                                                  "--show-managed-fields", "-o", "json"]
+        live = cluster.kube(args).stdout
+        if live.strip() and m.apply_manager(json.loads(live)):
+            found.append("/".join(key))
+    return found
+
+
 def render_drift(cluster, component, inputs, built):
     """Report pinned objects whose offline review render differs from Helm's own render against this cluster
     (`--dry-run=server`, which resolves lookups and the cluster's API capabilities)."""
@@ -291,8 +304,10 @@ def exercise(component, charts, cluster, scratch, apply="server"):
         built = m.render(USER, charts, cluster.kubeconfig, cluster.context, scratch)
         changes = built["changes"]
         report["renderDrift"] = render_drift(cluster, component, head, built)
-        require(bool(built["applied"]) == (apply == "server"),
-                f"Expected server-side apply forms only for a server-side release, found {len(built['applied'])}")
+        applied_by_helm = server_side_objects(cluster, built)
+        require(bool(applied_by_helm) == (apply == "server"),
+                f"Expected Helm's server-side applies only for a server-side release, found {len(applied_by_helm)}")
+        require(bool(built["applied"]), "The renderer produced no upgrade-result forms for the existing objects")
         expected = BASELINES[component]["expect"]
         require(sorted("/".join(k) for k in changes["added"]) == sorted(expected["added"])
                 and sorted("/".join(k) for k in changes["removed"]) == sorted(expected["removed"]),
@@ -339,7 +354,7 @@ def exercise(component, charts, cluster, scratch, apply="server"):
         settled(cluster, component, held=True)
         tampered = attempt(cluster, component, head, ["--set", COMMANDS[component]["releases"][0]["tamper"]])
         require(tampered.returncode and m.PIN_DENIED in tampered.stderr, "A tampered upgrade was not refused: " + tampered.stderr[-600:])
-    report.update(appliedForms=len(built["applied"]), changes={k: ["/".join(x) for x in v] for k, v in changes.items()}, guards=len(built["guards"]),
+    report.update(appliedForms=len(built["applied"]), serverSideObjects=len(applied_by_helm), changes={k: ["/".join(x) for x in v] for k, v in changes.items()}, guards=len(built["guards"]),
                   grants=len(built["grants"]), probes=len(built["probes"]), readinessDenials=len(denied),
                   releases={k: {"before": before[k], "after": after[k]} for k in after}, opensearchClaims=len(volumes),
                   refused=["upgrade without the manual lock", "tampered pod spec"], passed=True)

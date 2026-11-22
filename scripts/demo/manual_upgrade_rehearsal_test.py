@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import json
 from pathlib import Path
 import re
 import unittest
@@ -53,6 +54,27 @@ class ManualUpgradeRehearsalTest(unittest.TestCase):
         self.assertEqual(args, {"opensearch": "upgrade --install --namespace opensearch --create-namespace --wait --timeout 10m",
                                 "opensearch-dashboards": "upgrade --install --namespace opensearch --wait --timeout 60m",
                                 "otel-demo": "upgrade --install --namespace otel-demo --create-namespace --wait --timeout 15m"})
+
+    def test_the_apply_method_is_read_from_managed_fields_not_the_upgrade_forms(self):
+        """Client-side releases also get upgrade-result forms, so the method check reads Helm's own applies."""
+        objects = [{"kind": "Deployment", "metadata": {"name": n, "namespace": "otel-demo"}} for n in ("a", "b")]
+        managed = {"a": [{"manager": "helm", "operation": "Update"}],
+                   "b": [{"manager": "helm", "operation": "Apply", "subresource": "status"}, {"manager": "kubectl", "operation": "Apply"}]}
+
+        class Cluster:
+            def __init__(self, fields):
+                self.fields = fields
+
+            def kube(self, args, **_):
+                live = {"metadata": {"managedFields": self.fields[args[args.index("get") + 2]]}}
+                self.args = args
+                return type("Result", (), {"stdout": json.dumps(live)})()
+        built = {"defaulted": objects, "applied": {("otel-demo", "apps", "deployments", "a"): objects[0]}}
+        client = Cluster(managed)
+        self.assertEqual(rehearsal.server_side_objects(client, built), [])
+        self.assertIn("--show-managed-fields", client.args)
+        server = Cluster({**managed, "b": [{"manager": "helm", "operation": "Apply"}]})
+        self.assertEqual(rehearsal.server_side_objects(server, built), ["otel-demo/apps/deployments/b"])
 
     def test_every_component_has_a_locked_baseline_and_reviewed_expectations(self):
         self.assertEqual(set(rehearsal.COMMANDS), set(m.ALL_COMPONENTS))

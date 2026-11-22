@@ -667,6 +667,12 @@ class ManualUpgradeTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "No successful revision"):
             m.deployed_objects("config", "fixture", "/tmp")
 
+    def test_helm_targets_tolerate_null_labels_and_annotations(self):
+        target = m.helm_target({"kind": "ConfigMap", "metadata": {"name": "x", "labels": None, "annotations": None}}, "default", "prometheus")
+        self.assertEqual(target["metadata"]["labels"], {"app.kubernetes.io/managed-by": "Helm"})
+        self.assertEqual(target["metadata"]["annotations"], {"meta.helm.sh/release-name": "prometheus", "meta.helm.sh/release-namespace": "default"})
+        self.assertEqual(target["metadata"]["namespace"], "default")
+
     def test_release_methods_come_from_the_latest_helm_record(self):
         def record(version, method):
             body = {"name": "otel-demo", "version": version}

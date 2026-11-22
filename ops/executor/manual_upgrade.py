@@ -520,8 +520,12 @@ def helm_target(obj, namespace, release):
     meta = target["metadata"]
     if namespace:
         meta.setdefault("namespace", namespace)
-    meta.setdefault("labels", {})["app.kubernetes.io/managed-by"] = "Helm"
-    meta.setdefault("annotations", {}).update({"meta.helm.sh/release-name": release, "meta.helm.sh/release-namespace": namespace})
+    # Charts can render `labels: null` or `annotations: null`.
+    for field in ("labels", "annotations"):
+        if not meta.get(field):
+            meta[field] = {}
+    meta["labels"]["app.kubernetes.io/managed-by"] = "Helm"
+    meta["annotations"].update({"meta.helm.sh/release-name": release, "meta.helm.sh/release-namespace": namespace})
     return target
 
 

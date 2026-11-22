@@ -194,17 +194,33 @@ def webhook_checks(count, reference):
     return "(" + " && ".join(parts) + ")"
 
 
-def surface_expression(reviewed, *, created=False):
+def surface(obj):
+    """The pinned field values of an object, for comparing two reviewed forms."""
+    if obj["kind"] in WEBHOOKS:
+        return json.dumps(obj.get("webhooks") or [], sort_keys=True)
+    return json.dumps([at(obj, p, d) for p, d in SURFACE[obj["kind"]]], sort_keys=True)
+
+
+def take_expression(reviewed):
+    if reviewed["kind"] in WEBHOOKS:
+        return webhook_checks(len(reviewed.get("webhooks") or []), lambda p: r.literal(at(reviewed, p)))
+    return " && ".join(f"{value('object', p, d)} == dyn({r.literal(at(reviewed, p, d))})" for p, d in SURFACE[reviewed["kind"]])
+
+
+def surface_expression(reviewed, *, created=False, applied=None):
     """CEL: the update keeps the current security surface, or takes exactly the reviewed one. An object
-    this commit adds (`created`) must also be created with exactly the reviewed surface."""
+    this commit adds (`created`) must also be created with exactly the reviewed surface. `applied` is the same
+    render server-side applied onto the live object: Helm 4 merges into the live object for a release that uses
+    server-side apply, so the result can keep fields other managers own or a different list order."""
     kind = reviewed["kind"]
     if kind in WEBHOOKS:
         count = len(reviewed.get("webhooks") or [])
         keep = f'"webhooks" in dyn(oldObject) && size(dyn(oldObject)["webhooks"]) == {count} && ' + webhook_checks(count, lambda p: cel("oldObject", p))
-        take = webhook_checks(count, lambda p: r.literal(at(reviewed, p)))
     else:
         keep = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in SURFACE[kind])
-        take = " && ".join(f"{value('object', p, d)} == dyn({r.literal(at(reviewed, p, d))})" for p, d in SURFACE[kind])
+    take = take_expression(reviewed)
+    if applied is not None and surface(applied) != surface(reviewed):
+        take = "(" + take + ") || (" + take_expression(applied) + ")"
     expression = "(" + keep + ") || (" + take + ")"
     if kind == "StatefulSet":
         storage = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in STATEFUL_STORAGE)
@@ -218,7 +234,7 @@ def surface_expression(reviewed, *, created=False):
     return expression
 
 
-def pins(defaulted, policies, added=(), rows=None):
+def pins(defaulted, policies, added=(), rows=None, applied=None):
     """One UPDATE policy per pinned object, which also covers CREATE for an object this commit adds."""
     rows = records() if rows is None else rows
     expected = {key for key, row in rows.items() if (key[1], key[2]) in PINNED and not row.get("hookEvents")}
@@ -233,7 +249,8 @@ def pins(defaulted, policies, added=(), rows=None):
         tag = PREFIX + "-pin-" + hashlib.sha256("/".join(key).encode()).hexdigest()[:16]
         created = key in added
         guards += policies(tag, group, target, ["CREATE", "UPDATE"] if created else ["UPDATE"],
-                           surface_expression(obj, created=created), PIN_DENIED, condition=condition)
+                           surface_expression(obj, created=created, applied=(applied or {}).get(key)), PIN_DENIED,
+                           condition=condition)
     missing = sorted(expected - seen)
     r.require(not missing, "Reviewed privileged objects missing from the render: " + ", ".join("/".join(k) for k in missing))
     return guards
@@ -368,8 +385,10 @@ def grants(defaulted, subjects, changes=NO_CHANGES):
     for ns in NAMESPACES:
         rules[ns].append(r.rule("", "secrets", ["create", "delete", "update"]))
     for (scope, group, target), names in sorted(by_target(changes["added"]).items()):
-        # RBAC cannot name a created object; the create gate and the pins limit it.
+        # RBAC cannot name a created object; the create gate and the pins limit it. A server-side apply that
+        # creates is authorized as a named patch as well as a create.
         rules[scope].append(r.rule(group, target, ["create"]))
+        rules[scope].append(r.rule(group, target, ["patch"], names))
         if target in ("roles", "clusterroles"):
             # Escalation for a CREATE is checked against the collection, which has no resource name.
             rules[scope].append(r.rule(group, target, ["escalate"], [""]))
@@ -378,7 +397,7 @@ def grants(defaulted, subjects, changes=NO_CHANGES):
     return [item for scope, scoped in sorted(rules.items()) for item in r.bindings(PREFIX + "-upgrade", scope, scoped, (), subjects=subjects)]
 
 
-def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
+def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES, applied=None):
     """Return (guards, grants) for already server-defaulted pinned objects and hooks, and the objects the
     upgrade adds and removes (release_changes)."""
     r.require("oci-monitoring" in COMPONENTS or not defaulted_hooks, "Monitoring hooks outside a monitoring package")
@@ -386,7 +405,7 @@ def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
     policies = policy_builder(user)
     hook_names = hook_targets(defaulted_hooks)
     rows = current(changes)
-    guards = (pins(defaulted, policies, set(map(tuple, changes["added"])), rows) + lock_gates(rows, policies)
+    guards = (pins(defaulted, policies, set(map(tuple, changes["added"])), rows, applied) + lock_gates(rows, policies)
               + history(policies, changes) + change_gates(changes, policies, hook_names))
     hook_guards, hook_grants = [], []
     if "oci-monitoring" in COMPONENTS:
@@ -456,6 +475,38 @@ def server_defaults(objects, kube):
         r.require(admitted["metadata"].get("namespace") == trial["metadata"].get("namespace"), "Admitted object changed namespace")
         admitted["metadata"]["name"] = obj["metadata"]["name"]
         result.append(admitted)
+    return result
+
+
+def apply_manager(live):
+    """The field manager that last server-side applied a live object, or None for a client-side release."""
+    managers = sorted({f["manager"] for f in live["metadata"].get("managedFields") or [] if f.get("operation") == "Apply"})
+    return ("helm" if "helm" in managers else managers[0]) if managers else None
+
+
+def server_applied(objects, kube):
+    """For each pinned object that exists and was last server-side applied, the object the same apply of this
+    render produces: a nonpersistent `apply --server-side --dry-run=server` under the live object's manager."""
+    result = {}
+    for obj, namespace in objects:
+        group, target = KINDS[obj["kind"]]
+        cluster = obj["kind"].startswith("Cluster") or obj["kind"] in WEBHOOKS
+        where = [] if cluster else ["-n", obj["metadata"].get("namespace", namespace)]
+        found = subprocess.run([*kube, *where, "get", resource_arg(group, target), obj["metadata"]["name"], "--ignore-not-found", "-o", "json"],
+                               capture_output=True, timeout=30, check=True).stdout
+        manager = apply_manager(json.loads(found)) if found.strip() else None
+        if not manager:
+            continue
+        trial = copy.deepcopy(obj)
+        if not cluster:
+            trial["metadata"]["namespace"] = obj["metadata"].get("namespace", namespace)
+        completed = subprocess.run([*kube, "apply", "--server-side", "--dry-run=server", "--force-conflicts", "--field-manager=" + manager,
+                                    "-f", "-", "-o", "json"], input=adapter.encode(trial), capture_output=True, timeout=30)
+        if completed.returncode:
+            raise RuntimeError("Server-side dry-run apply failed for " + obj["kind"] + "/" + obj["metadata"]["name"])
+        admitted = json.loads(completed.stdout)
+        r.require(admitted["kind"] == obj["kind"] and admitted["metadata"]["name"] == obj["metadata"]["name"], "Unexpected applied object")
+        result[ident(admitted)] = admitted
     return result
 
 
@@ -631,10 +682,12 @@ def render(user, charts, kubeconfig, context, scratch):
     pinned, located, rendered = render_pinned(charts, scratch)
     changes = release_changes(deployed_objects(kubeconfig, context, scratch), rendered)
     defaulted = server_defaults(pinned, kube)
+    applied = server_applied(pinned, kube)
     definitions = hooks.pinned_hooks(located["oci-monitoring"]) if "oci-monitoring" in COMPONENTS else []
     defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
-    guards, granted = package(user, defaulted, defaulted_hooks, changes)
+    guards, granted = package(user, defaulted, defaulted_hooks, changes, applied)
     return {"guards": guards, "grants": granted, "changes": changes, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
+            "defaulted": defaulted, "applied": applied,
             "probes": readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]}),
             "archives": {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}}
 

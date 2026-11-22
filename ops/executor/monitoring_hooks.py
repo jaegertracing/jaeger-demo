@@ -142,6 +142,11 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
             policy["spec"]["validations"] = policy["spec"]["validations"][1:]
             binding["spec"]["paramRef"].update(namespace=r.OPS, name=archive_name)
         guards.extend([policy, binding])
+        if kind == "ConfigMap" and scoped:
+            # The inventory gate holds the lock for CREATE and DELETE only; the manual package's named patch
+            # needs the same lock for an UPDATE, which this comparison against the archive cannot check.
+            guards.extend(policies(tag + "-update-lock", group, target, ["UPDATE"], "true",
+                                   "A manual deployment lock holder is required", condition=predicate))
     for (scope, group, target), names in sorted(by_target.items()):
         valid = "request.name in " + json.dumps(sorted(names))
         created = sorted(set(names) | set((exempt_create or {}).get((scope, group, target), ())))

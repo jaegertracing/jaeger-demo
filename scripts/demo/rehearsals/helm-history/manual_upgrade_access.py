@@ -236,8 +236,10 @@ def exercise(charts, kubectl, cfg, kube):
                           subjects=[{"kind": "User", "apiGroup": m.RBAC_GROUP, "name": USER}])
     expect_denied("retired ClusterRoleBinding recreated as the operator role",
                   user(["create", "-f", "-", "--dry-run=server"], json.dumps(takeover)), "Only the twelve")
-    expect_denied("update of the dropped Secret", user(["-n", "default", "patch", "secret", "fixture-retired", "--type=merge",
-                                                        "-p", json.dumps({"stringData": {"fixture": "changed"}}), "--dry-run=server"]),
+    # The Secret grant is update, not patch, as Helm uses it: replace the object so admission decides.
+    dropped = json.loads(kube(["-n", "default", "get", "secret", "fixture-retired", "-o", "json"]).stdout)
+    dropped["data"] = {"fixture": "Y2hhbmdlZA=="}
+    expect_denied("update of the dropped Secret", user(["replace", "-f", "-", "--dry-run=server"], json.dumps(dropped)),
                   m.HISTORY_DENIED)
     tampered = m.creatable(added[0], rendered[added[0]])
     tampered["spec"]["template"]["spec"]["serviceAccountName"] = "prometheus-kube-prometheus-operator"

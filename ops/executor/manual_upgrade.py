@@ -22,13 +22,16 @@ and applies the guards before the grants. See docs/manual-upgrade-access.md.
 """
 
 import argparse
+import base64
 from collections import defaultdict
 import contextlib
 import copy
 import hashlib
 import json
+import gzip
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -481,6 +484,7 @@ def server_defaults(objects, kube):
 
 
 HELM_MANAGER = "helm"
+PREVIEW_HELPER = "jaeger-helm-preview"
 
 
 def apply_manager(live):
@@ -491,71 +495,81 @@ def apply_manager(live):
     return HELM_MANAGER if HELM_MANAGER in applied else None
 
 
-def named(items):
-    return isinstance(items, list) and bool(items) and all(isinstance(i, dict) and "name" in i for i in items)
+def release_methods(kube):
+    """Each release's Helm apply method from its latest stored record, which `--server-side auto` reuses.
+    Managed fields cannot tell: a release once applied server-side and later client-side keeps Helm's Apply entries."""
+    methods = {}
+    for key in RELEASE_KEYS:
+        namespace, release = adapter.RELEASES[key][:2]
+        found = json.loads(subprocess.run([*kube, "-n", namespace, "get", "secrets", "-l", f"owner=helm,name={release}", "-o", "json"],
+                                          capture_output=True, timeout=60, check=True).stdout)["items"]
+        r.require(found, "No Helm release record for " + release)
+        latest = max(found, key=lambda item: int(item["metadata"]["labels"]["version"]))
+        raw = base64.b64decode(base64.b64decode(latest["data"]["release"], validate=True), validate=True)
+        if raw.startswith(b"\x1f\x8b"):
+            raw = gzip.decompress(raw)
+        method = json.loads(raw).get("apply_method", "") or "csa"
+        r.require(method in ("csa", "ssa"), "Unknown Helm release apply method")
+        methods[key] = method
+    return methods
 
 
-def client_merged(reviewed, new, old, live):
-    """The result of Helm's client-side three-way patch (deployed manifest, this render, live object), from the
-    server-defaulted render. A field this render sets takes the reviewed value. A field the deployed manifest set
-    and this render drops is deleted, so the server defaults it again: the reviewed value. A field neither set
-    keeps its live value, such as a server default that depended on a field the upgrade changed. Lists of named
-    items merge per name, as the strategic merge patch does."""
-    if isinstance(reviewed, dict) and isinstance(live, dict):
-        new, old = (new if isinstance(new, dict) else {}), (old if isinstance(old, dict) else {})
-        merged = {}
-        for key in sorted(set(reviewed) | set(live)):
-            if key in new:
-                if key in reviewed:
-                    merged[key] = client_merged(reviewed[key], new[key], old.get(key), live.get(key))
-            elif key in old or key not in live:
-                if key in reviewed:
-                    merged[key] = copy.deepcopy(reviewed[key])
-            else:
-                merged[key] = copy.deepcopy(live[key])
-        return merged
-    if named(reviewed) and named(live):
-        by_name = {i["name"]: i for i in live}
-        new_by = {i["name"]: i for i in new} if named(new) else {}
-        old_by = {i["name"]: i for i in old} if named(old) else {}
-        merged = [client_merged(i, new_by.get(i["name"]), old_by.get(i["name"]), by_name.get(i["name"])) for i in reviewed]
-        rendered = {i["name"] for i in reviewed}
-        return merged + [copy.deepcopy(i) for i in live if i["name"] not in rendered and i["name"] not in old_by]
-    return copy.deepcopy(reviewed)
+def helm_target(obj, namespace, release):
+    """The object as Helm sends it: its namespace defaulted, with Helm's ownership labels and annotations."""
+    target = copy.deepcopy(obj)
+    meta = target["metadata"]
+    if namespace:
+        meta.setdefault("namespace", namespace)
+    meta.setdefault("labels", {})["app.kubernetes.io/managed-by"] = "Helm"
+    meta.setdefault("annotations", {}).update({"meta.helm.sh/release-name": release, "meta.helm.sh/release-namespace": namespace})
+    return target
 
 
-def applied_forms(objects, defaulted, deployed, kube):
-    """For each pinned object that exists, the object Helm's upgrade of this render produces when that differs
-    from a fresh create: the server-side dry-run apply under Helm's field manager for a server-side release, or
-    client_merged() for a client-side one."""
+def applied_forms(objects, defaulted, deployed, methods, kube, helper=PREVIEW_HELPER):
+    """For each pinned object the release already has, the object Helm's upgrade of this render produces, as a
+    nonpersistent server dry-run, the way the executor previews it (scheduled_approvals.preview). A server-side
+    release is a dry-run apply under Helm's field manager. A client-side release is Helm 4.3.2's own patch, from
+    jaeger-helm-preview (ops/executor/preview): a three-way strategic merge for built-in kinds and a two-way JSON
+    merge for custom resources, applied to the live object."""
     result = {}
     for (obj, namespace), reviewed in zip(objects, defaulted):
-        group, target = KINDS[obj["kind"]]
-        cluster = obj["kind"].startswith("Cluster") or obj["kind"] in WEBHOOKS
-        where = [] if cluster else ["-n", obj["metadata"].get("namespace", namespace)]
-        # kubectl leaves managedFields out of its output unless asked.
-        found = subprocess.run([*kube, *where, "get", resource_arg(group, target), obj["metadata"]["name"], "--ignore-not-found",
-                                "--show-managed-fields", "-o", "json"],
-                               capture_output=True, timeout=30, check=True).stdout
-        live = json.loads(found) if found.strip() else None
-        manager = apply_manager(live) if live else None
-        if live and not manager:
-            key = ident(reviewed)
-            if key in deployed:
-                result[key] = client_merged(reviewed, obj, deployed[key], live)
+        key = ident(reviewed)
+        if key not in deployed:
             continue
-        if not manager:
-            continue
-        trial = copy.deepcopy(obj)
-        if not cluster:
-            trial["metadata"]["namespace"] = obj["metadata"].get("namespace", namespace)
-        completed = subprocess.run([*kube, "apply", "--server-side", "--dry-run=server", "--force-conflicts", "--field-manager=" + manager,
-                                    "-f", "-", "-o", "json"], input=adapter.encode(trial), capture_output=True, timeout=30)
+        owner, prior = deployed[key]
+        release_ns, release = adapter.RELEASES[owner][:2]
+        cluster = key[0] == "cluster"
+        where = [] if cluster else ["-n", key[0]]
+        target = helm_target(obj, None if cluster else key[0], release)
+        if cluster:
+            target["metadata"]["annotations"]["meta.helm.sh/release-namespace"] = release_ns
+        if methods[owner] == "ssa":
+            command = [*kube, "apply", "--server-side", "--dry-run=server", "--force-conflicts=false", "--field-manager=" + HELM_MANAGER,
+                       "-f", "-", "-o", "json"]
+            completed = subprocess.run(command, input=adapter.encode(target), capture_output=True, timeout=30)
+        else:
+            original = copy.deepcopy(prior)
+            if not cluster:
+                original["metadata"].setdefault("namespace", key[0])
+            live = subprocess.run([*kube, *where, "get", resource_arg(key[1], key[2]), key[3], "-o", "json"],
+                                  capture_output=True, timeout=30, check=True).stdout
+            preview = subprocess.run([helper], input=json.dumps({"original": original, "desired": target, "live": json.loads(live)}).encode(),
+                                     capture_output=True, timeout=60)
+            r.require(not preview.returncode, "jaeger-helm-preview failed for " + "/".join(key))
+            patch = json.loads(preview.stdout)
+            r.require(set(patch) == {"type", "patch"} and patch["type"] in ("strategic", "merge") and isinstance(patch["patch"], dict),
+                      "Invalid offline Helm patch preview")
+            if not patch["patch"]:
+                result[key] = json.loads(live)
+                continue
+            completed = subprocess.run([*kube, *where, "patch", resource_arg(key[1], key[2]), key[3], "--type=" + patch["type"],
+                                        "--patch-file=/dev/stdin", "--dry-run=server", "--field-manager=" + HELM_MANAGER, "-o", "json"],
+                                       input=json.dumps(patch["patch"]).encode(), capture_output=True, timeout=30)
         if completed.returncode:
-            raise RuntimeError("Server-side dry-run apply failed for " + obj["kind"] + "/" + obj["metadata"]["name"])
+            raise RuntimeError("Upgrade preview failed for " + "/".join(key))
         admitted = json.loads(completed.stdout)
-        r.require(admitted["kind"] == obj["kind"] and admitted["metadata"]["name"] == obj["metadata"]["name"], "Unexpected applied object")
-        result[ident(admitted)] = admitted
+        r.require(ident(admitted) == key, "Unexpected previewed object")
+        result[key] = admitted
     return result
 
 
@@ -595,14 +609,14 @@ def identity(key, obj, namespace):
 
 
 def deployed_objects(kubeconfig, context, scratch):
-    """Each release's deployed manifest by identity. `helm get manifest` leaves out hooks."""
+    """Each release's deployed manifest by identity, with the release key. `helm get manifest` leaves out hooks."""
     env = {"PATH": os.environ["PATH"], "HOME": str(scratch)}
     found = {}
     for key in RELEASE_KEYS:
         namespace, release = adapter.RELEASES[key][:2]
         manifest = subprocess.run(["helm", "get", "manifest", release, "--namespace", namespace, "--kubeconfig", kubeconfig,
                                    "--kube-context", context], env=env, capture_output=True, timeout=120, check=True).stdout
-        found.update({identity(key, obj, namespace): obj for obj in yaml.safe_load_all(manifest) if obj})
+        found.update({identity(key, obj, namespace): (key, obj) for obj in yaml.safe_load_all(manifest) if obj})
     return found
 
 
@@ -724,7 +738,7 @@ def clean_commit():
     return head
 
 
-def render(user, charts, kubeconfig, context, scratch):
+def render(user, charts, kubeconfig, context, scratch, helper=None):
     """The package for the selected components against the cluster's deployed releases: guards, grants,
     probes, the objects the upgrade adds and drops, and the archive digests."""
     kube = ["kubectl", "--kubeconfig", kubeconfig, "--context", context, "--request-timeout=15s"]
@@ -732,7 +746,8 @@ def render(user, charts, kubeconfig, context, scratch):
     deployed = deployed_objects(kubeconfig, context, scratch)
     changes = release_changes(deployed, rendered)
     defaulted = server_defaults(pinned, kube)
-    applied = applied_forms(pinned, defaulted, deployed, kube)
+    applied = applied_forms(pinned, defaulted, deployed, release_methods(kube), kube,
+                            helper or shutil.which(PREVIEW_HELPER) or PREVIEW_HELPER)
     definitions = hooks.pinned_hooks(located["oci-monitoring"]) if "oci-monitoring" in COMPONENTS else []
     defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
     guards, granted = package(user, defaulted, defaulted_hooks, changes, applied)
@@ -748,6 +763,8 @@ def main():
     parser.add_argument("--components", nargs="+", choices=ALL_COMPONENTS, default=list(ALL_COMPONENTS),
                         help="Only the components this upgrade changes (default: all three)")
     parser.add_argument("--charts", type=Path, help="Verified chart archives from scheduled_inputs.charts_for; fetched when omitted")
+    parser.add_argument("--preview-helper", default=shutil.which(PREVIEW_HELPER) or PREVIEW_HELPER,
+                        help="jaeger-helm-preview built from ops/executor/preview, for client-side releases")
     parser.add_argument("--kubeconfig", required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--cluster-uid", required=True)
@@ -767,7 +784,7 @@ def main():
             staging.mkdir()
             scheduled_inputs.charts_for(ROOT, staging, scheduled_inputs.public_env(staging))
             charts = staging / "charts"
-        built = render(args.user, charts, args.kubeconfig, args.context, scratch)
+        built = render(args.user, charts, args.kubeconfig, args.context, scratch, args.preview_helper)
     changes = built["changes"]
     args.output.mkdir(mode=0o700)
     summary = {"configurationSHA": commit, "clusterUID": args.cluster_uid, "kubernetes": kube_version, "components": args.components,

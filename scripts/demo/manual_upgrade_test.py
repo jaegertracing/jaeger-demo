@@ -1,7 +1,9 @@
 # Copyright (c) 2026 The Jaeger Authors.
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import copy
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -638,58 +640,57 @@ class ManualUpgradeTests(unittest.TestCase):
         self.assertTrue(any(m.take_expression(reordered) in g["spec"]["validations"][1]["expression"]
                             for g in guards if g["kind"] == "ValidatingAdmissionPolicy"))
 
-    def test_server_side_apply_dry_runs_only_objects_a_manager_applied(self):
-        live = {"helm": {"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply"},
-                                                        {"manager": "kube-controller-manager", "operation": "Update"}]}},
-                "client": {"metadata": {"managedFields": [{"manager": "helm", "operation": "Update"}]}}}
-        self.assertEqual(m.apply_manager(live["helm"]), "helm")
-        self.assertIsNone(m.apply_manager(live["client"]))
+    def test_helm_apply_managers_are_read_from_the_main_resource_only(self):
+        self.assertEqual(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply"}]}}), "helm")
+        self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Update"}]}}))
         self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "other", "operation": "Apply"}]}}))
         self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply", "subresource": "status"}]}}))
-        objects = [o for o in self.pinned if o["kind"] == "Deployment"][:3]
-        modes = dict(zip((o["metadata"]["name"] for o in objects), ("helm", "client", None)))
+
+    def test_release_methods_come_from_the_latest_helm_record(self):
+        def record(version, method):
+            body = {"name": "otel-demo", "version": version}
+            if method:
+                body["apply_method"] = method
+            inner = base64.b64encode(gzip.compress(json.dumps(body).encode()))
+            return {"metadata": {"labels": {"version": str(version)}}, "data": {"release": base64.b64encode(inner).decode()}}
+        for records, expected in (([record(1, "ssa"), record(2, "csa")], "csa"), ([record(3, "ssa"), record(2, "")], "ssa"),
+                                  ([record(1, "")], "csa")):
+            with self.subTest(expected=expected), mock.patch.object(m, "RELEASE_KEYS", ("otel-demo",)), \
+                    mock.patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps({"items": records}).encode(), b"")):
+                self.assertEqual(m.release_methods(["kubectl"]), {"otel-demo": expected})
+
+    def test_upgrade_previews_follow_each_release_apply_method(self):
+        objects = [o for o in self.pinned if o["kind"] == "Deployment" and o["metadata"]["namespace"] == "otel-demo"][:2]
+        objects.append(next(o for o in self.pinned if o["kind"] == "Deployment" and o["metadata"]["namespace"] == "default"))
+        owners = {"otel-demo": "otel-demo", "default": "oci-monitoring"}
+        deployed = {m.ident(o): (owners[o["metadata"]["namespace"]], o) for o in objects[1:]}
         calls = []
 
         def fake(argv, **kw):
             calls.append(argv)
+            if argv == ["preview-helper"]:
+                sent = json.loads(kw["input"])
+                self.assertEqual(set(sent), {"original", "desired", "live"})
+                self.assertEqual(sent["desired"]["metadata"]["labels"]["app.kubernetes.io/managed-by"], "Helm")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "strategic", "patch": {"spec": {}}}).encode(), b"")
             if "get" in argv:
-                mode = modes[argv[argv.index("get") + 2]]
-                return subprocess.CompletedProcess(argv, 0, json.dumps(live[mode]).encode() if mode else b"", b"")
-            body = json.loads(kw["input"])
-            body["metadata"]["uid"] = UID
+                return subprocess.CompletedProcess(argv, 0, json.dumps(objects[1]).encode(), b"")
+            body = objects[1] if "patch" in argv else json.loads(kw["input"])
             return subprocess.CompletedProcess(argv, 0, json.dumps(body).encode(), b"")
 
-        deployed = {m.ident(o): o for o in objects}
         with mock.patch.object(m.subprocess, "run", side_effect=fake):
-            applied = m.applied_forms([(o, o["metadata"]["namespace"]) for o in objects], objects, deployed, ["kubectl"])
-        # Server-side: a dry-run apply. Client-side: the three-way merge, with no API call. Absent: nothing.
-        self.assertEqual(sorted(applied), sorted([m.ident(objects[0]), m.ident(objects[1])]))
-        apply_calls = [c for c in calls if "apply" in c]
-        self.assertEqual(len(apply_calls), 1)
-        for flag in ("--server-side", "--dry-run=server", "--field-manager=helm"):
-            self.assertIn(flag, apply_calls[0])
-        self.assertTrue(all("--show-managed-fields" in c for c in calls if "get" in c))
-
-    def test_client_side_merge_keeps_only_defaults_helm_never_set(self):
-        def container(**fields):
-            return {"name": "c", "image": "registry.example/c@sha256:" + "a" * 64, **fields}
-
-        def pod(containers, **fields):
-            return {"kind": "Deployment", "spec": {"template": {"spec": {"containers": containers, **fields}}}}
-        new = pod([container(env=[{"name": "NEW", "value": "1"}])])
-        reviewed = pod([container(env=[{"name": "NEW", "value": "1"}], imagePullPolicy="IfNotPresent")], dnsPolicy="ClusterFirst")
-        live = pod([container(env=[{"name": "GONE", "value": "0"}, {"name": "OTHER", "value": "x"}], imagePullPolicy="Always")],
-                   dnsPolicy="ClusterFirst")
-        old = pod([container(env=[{"name": "GONE", "value": "0"}])])
-        merged = m.client_merged(reviewed, new, old, live)["spec"]["template"]["spec"]
-        # The defaulted pull policy neither manifest set stays; the dropped env var goes; another writer's stays.
-        self.assertEqual(merged["containers"][0]["imagePullPolicy"], "Always")
-        self.assertEqual([e["name"] for e in merged["containers"][0]["env"]], ["NEW", "OTHER"])
-        # A field the deployed manifest set and the render drops is deleted and defaulted again.
-        old["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = "Always"
-        merged = m.client_merged(reviewed, new, old, live)["spec"]["template"]["spec"]
-        self.assertEqual(merged["containers"][0]["imagePullPolicy"], "IfNotPresent")
-        self.assertEqual(m.client_merged(reviewed, new, old, None), reviewed)
+            forms = m.applied_forms([(o, o["metadata"]["namespace"]) for o in objects], objects, deployed,
+                                    {"otel-demo": "csa", "oci-monitoring": "ssa"}, ["kubectl"], "preview-helper")
+        # The object the release lacks (added) gets none; client-side previews Helm's patch; server-side applies.
+        self.assertEqual(sorted(forms), sorted(deployed))
+        patches = [c for c in calls if "patch" in c]
+        self.assertEqual(len(patches), 1)
+        for flag in ("--type=strategic", "--dry-run=server", "--field-manager=helm"):
+            self.assertIn(flag, patches[0])
+        applies = [c for c in calls if "apply" in c]
+        self.assertEqual(len(applies), 1)
+        for flag in ("--server-side", "--dry-run=server", "--field-manager=helm", "--force-conflicts=false"):
+            self.assertIn(flag, applies[0])
 
     def test_absent_empty_and_null_lists_compare_equal(self):
         role = next(o for o in self.pinned if o["kind"] == "Role")

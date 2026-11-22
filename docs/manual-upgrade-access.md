@@ -73,15 +73,18 @@ creating the guards first does not by itself prove they enforce before the grant
 do. Lock-only gates also return the same lock message as the content pins, so a
 lock denial does not show that a pin is loaded.
 [`ops/executor/manual_upgrade_verify.py`](../ops/executor/manual_upgrade_verify.py)
-checks that every guard in `guards.json` is installed unchanged, then runs the
-server dry-run probes in `probes.json` as the user. Each probe must be denied with
+checks that every guard in `guards.json` is installed unchanged and that none of
+the twelve hooks is left from a failed run, then runs the server dry-run probes in `probes.json` as the user. Each probe must be denied with
 its own policy's message. Close the window procedurally, with the `demo-apply`
 environment reviewer as the gate:
 
 1. Confirm that no Deploy, OpenSearch recovery or volume expansion run is in
    progress or waiting for approval, and that `default/jaeger-demo-deployment-revisions`
    exists and is not held by a `manual/` run. Approve no `demo-apply` deployment
-   until step 6 passes.
+   until step 6 passes. Delete any hook left by a failed monitoring upgrade as an
+   administrator: Helm deletes it before recreating it, and the guards check that
+   delete against this commit's hook, so a leftover from an earlier chart version
+   would block the retry.
 2. Apply `guards.json` with `kubectl create -f`. The hook CRD archive is too large
    for a client-side apply annotation.
 3. Apply `grants.json`. Grants never go in before their guards.
@@ -155,7 +158,8 @@ binding to the user, a cluster-admin binding, arbitrary Secrets, an unreviewed
 ConfigMap in `default`, and every write without a manual lock or parameter. It
 admits metadata changes, a restored reviewed rule set, a webhook CA rotation, the
 reviewed hooks and canonical history records. It renders the package with a failed
-hook Job left in the cluster, and runs `manual_upgrade_verify.py` in both phases
+hook Job from an earlier chart version left in the cluster, shows that the user
+cannot delete it and the verifier refuses until an administrator does, and runs `manual_upgrade_verify.py` in both phases
 against the installed package, skipping lock gates of kinds the fixture never
 creates. With a stand-in for the Stage 1
 Roles, which are not in the repository, it also admits Jaeger history records in

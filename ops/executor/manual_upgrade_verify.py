@@ -4,7 +4,8 @@
 
 Admission policies load asynchronously, and lock-only gates return the same lock
 message as the content pins, so lock denials alone cannot show that a pin is loaded.
-This checks that every guard in guards.json is installed unchanged, then runs the
+This checks that every guard in guards.json is installed unchanged and that no hook
+from a failed run is left behind, then runs the
 server dry-run probes from probes.json as the manual user:
 
   --phase unlocked  no manual holder: every lock gate must deny.
@@ -57,6 +58,24 @@ def installed(guards, kube):
     return len(guards)
 
 
+def leftover_hooks(probes, kube):
+    """Hooks exist only during a hook run; the chart deletes them on success. A failed run leaves them, and
+    Helm's before-hook-creation delete is checked against this commit's hook, so an older leftover would
+    block the retry. An administrator removes leftovers before a run is approved."""
+    found = []
+    for probe in probes:
+        if probe["expect"] != m.HOOK_DENIED:
+            continue
+        meta = probe["body"]["metadata"]
+        namespace = ["-n", meta["namespace"]] if meta.get("namespace") else []
+        got = subprocess.run([*kube, *namespace, "get", m.resource_arg(*m.hooks.KINDS[probe["body"]["kind"]]), meta["name"],
+                              "--ignore-not-found", "-o", "name"], capture_output=True, text=True, timeout=60, check=True)
+        if got.stdout.strip():
+            found.append(got.stdout.strip())
+    r.require(not found, "Delete leftover hooks before approving a run: " + ", ".join(found))
+    return 0
+
+
 def holder(kube):
     got = subprocess.run([*kube, "-n", "default", "get", "configmap", r.CHECKPOINT, "-o", "json"],
                          capture_output=True, timeout=60, check=True)
@@ -107,7 +126,8 @@ def main():
     kube = ["kubectl", "--kubeconfig", args.kubeconfig, "--context", args.context, "--request-timeout=30s"]
     guards = json.loads((args.package / "guards.json").read_bytes())["items"]
     probes = json.loads((args.package / "probes.json").read_bytes())
-    report = {"phase": args.phase, "guards": installed(guards, kube), "denied": run(probes, args.phase, kube, args.user)}
+    report = {"phase": args.phase, "guards": installed(guards, kube), "leftoverHooks": leftover_hooks(probes, kube),
+              "denied": run(probes, args.phase, kube, args.user)}
     print(json.dumps(report, indent=2))
 
 

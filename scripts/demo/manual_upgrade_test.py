@@ -368,6 +368,26 @@ class ManualUpgradeTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "Not enforced: pin"):
             verify.run([probe], "held", ["kubectl"], USER)
 
+    def test_verifier_refuses_hooks_left_by_a_failed_run(self):
+        probes = m.readiness_probes(self.pinned, self.hooks)
+        job = next(h for h in self.hooks if h["kind"] == "Job")
+        asked = []
+
+        def cluster(present):
+            def fake(argv, **_):
+                asked.append(argv)
+                hit = present in argv
+                return subprocess.CompletedProcess(argv, 0, "job.batch/" + present + "\n" if hit else "", "")
+            return fake
+
+        with mock.patch.object(verify.subprocess, "run", side_effect=cluster(job["metadata"]["name"])), \
+                self.assertRaisesRegex(ValueError, "Delete leftover hooks.*" + job["metadata"]["name"]):
+            verify.leftover_hooks(probes, ["kubectl"])
+        self.assertEqual(len(asked), len(self.hooks))
+        self.assertTrue(all("--ignore-not-found" in a for a in asked))
+        with mock.patch.object(verify.subprocess, "run", side_effect=cluster("absent")):
+            self.assertEqual(verify.leftover_hooks(probes, ["kubectl"]), 0)
+
     def test_installed_guards_must_match_guards_json(self):
         policy = next(g for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy")
         served = copy.deepcopy(policy)

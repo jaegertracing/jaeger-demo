@@ -89,23 +89,18 @@ def exercise(charts, kubectl, cfg, kube):
         install_operator_crds(located["oci-monitoring"], kube, scratch)
         defaulted = m.server_defaults(pinned, admin)
         definitions = hooks.pinned_hooks(located["oci-monitoring"])
-        # A failed hook Job stays behind (no hook-failed delete policy); rendering must still succeed.
-        leftover = next(d for d in definitions if d["kind"] == "Job")
+        # A failed hook Job from an earlier chart version stays behind (no hook-failed delete policy);
+        # rendering must still succeed.
+        leftover = copy.deepcopy(next(d for d in definitions if d["kind"] == "Job"))
+        leftover["metadata"].setdefault("labels", {})["helm.sh/chart"] = "kube-prometheus-stack-0.0.1"
         kube(["create", "-f", "-"], body=json.dumps(leftover))
         defaulted_hooks = m.dry_admitted_hooks(definitions, admin)
-        kube(["-n", "default", "delete", "job", leftover["metadata"]["name"], "--wait=true"])
     guards, grants = m.package(USER, defaulted, defaulted_hooks)
     for item in guards + grants + stage1_fixture():
         kube(["create", "-f", "-"], body=json.dumps(item))
     for obj in defaulted:
         kube(["create", "-f", "-"], body=json.dumps(live(obj)))
     by_kind = {(o["kind"], o["metadata"]["name"]): o for o in defaulted}
-
-    # The operator's readiness check, as documented: every guard installed, then content-specific
-    # denials under a manual holder. Lock gates of kinds this fixture never creates are skipped below.
-    probes = m.readiness_probes(defaulted, definitions)
-    verify.installed(guards, admin)
-    readiness = verify.run(probes, "held", admin, USER)
 
     def user(args, body=None):
         return kube([*as_user, *args], body=body, check=False)
@@ -123,6 +118,27 @@ def exercise(charts, kubectl, cfg, kube):
         if result.returncode:
             raise ValueError(f"Expected {label} to be admitted: {result.stderr[:700]}")
         allowed.append(label)
+
+    # The operator's readiness check, as documented: every guard installed, then content-specific
+    # denials under a manual holder. Lock gates of kinds this fixture never creates are skipped below.
+    probes = m.readiness_probes(defaulted, definitions)
+    verify.installed(guards, admin)
+    # Helm's before-hook-creation delete of the older leftover is checked against this commit's hook,
+    # so the retry would fail: the verifier refuses until an administrator removes it.
+    stale = eventually(lambda: user(["-n", "default", "delete", "job", leftover["metadata"]["name"], "--dry-run=server"]),
+                       lambda result: result.returncode and "Hook differs" in result.stderr)
+    expect_denied("manual user deleting an older leftover hook", stale, "Hook differs")
+    try:
+        verify.leftover_hooks(probes, admin)
+    except ValueError as refused:
+        if leftover["metadata"]["name"] not in str(refused):
+            raise
+    else:
+        raise ValueError("The verifier accepted a leftover hook")
+    denied.append("readiness with a leftover hook")
+    kube(["-n", "default", "delete", "job", leftover["metadata"]["name"], "--wait=true"])
+    verify.leftover_hooks(probes, admin)
+    readiness = verify.run(probes, "held", admin, USER)
 
     wildcard = [{"op": "add", "path": "/rules/-", "value": {"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}}]
     first = eventually(lambda: patch("clusterrole", "prometheus-kube-prometheus-operator", None, wildcard),

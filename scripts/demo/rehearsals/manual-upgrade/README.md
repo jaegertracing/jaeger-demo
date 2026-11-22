@@ -36,8 +36,8 @@ production manual upgrade before it merges.
 
 ## Reproduce
 
-Use Python 3 with PyYAML, Helm 4.3.2, kubectl and kind with a Linux container
-runtime. From the repository root, with the verified archives from
+Use Python 3 with PyYAML, Helm 4.3.2, kubectl, `jaeger-helm-preview` on `PATH`
+(built from `ops/executor/preview`) and kind with a Linux container runtime. From the repository root, with the verified archives from
 `scheduled_inputs.charts_for` in `$charts`:
 
 ```bash

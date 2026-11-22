@@ -128,6 +128,14 @@ jobs:
         staging.mkdir()
         scheduled_inputs.charts_for(Path.cwd(), staging, scheduled_inputs.public_env(staging))
         PYTHON
+    - name: Build the Helm 4.3.2 client-side patch preview helper
+      env:
+        GOTOOLCHAIN: go1.27.4
+        CGO_ENABLED: 0
+      run: |
+        mkdir -p "$RUNNER_TEMP/preview-bin"
+        (cd ops/executor/preview && go mod verify && go test -mod=readonly ./... && go build -mod=readonly -o "$RUNNER_TEMP/preview-bin/jaeger-helm-preview" .)
+        echo "$RUNNER_TEMP/preview-bin" >> "$GITHUB_PATH"
     - name: Allow the OpenSearch memory map count
       if: matrix.component == 'opensearch'
       run: sudo sysctl -w vm.max_map_count=262144

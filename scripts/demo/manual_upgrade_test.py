@@ -607,6 +607,18 @@ class ManualUpgradeTests(unittest.TestCase):
         executor_guards, executor_grants = hooks.controls(self.hooks)
         self.assertFalse(any("patch" in rule["verbs"] for o in executor_grants if "rules" in o for rule in o["rules"]))
 
+    def test_a_patched_hook_configmap_still_needs_the_lock(self):
+        configmap = next(h for h in self.hooks if h["kind"] == "ConfigMap")
+        gates = [g["spec"] for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy"
+                 and g["metadata"]["name"].endswith("-update-lock")]
+        self.assertEqual(len(gates), 1)
+        spec, = gates
+        self.assertEqual(spec["matchConstraints"]["resourceRules"][0]["operations"], ["UPDATE"])
+        self.assertEqual(spec["validations"][0]["message"], m.LOCK_DENIED)
+        self.assertIn('"' + configmap["metadata"]["name"] + '"', " ".join(c["expression"] for c in spec["matchConditions"]))
+        executor_guards, _ = hooks.controls(self.hooks)
+        self.assertFalse([g for g in executor_guards if g["metadata"]["name"].endswith("-update-lock")])
+
     def test_pins_also_accept_the_server_side_applied_form(self):
         deployment = next(o for o in self.pinned if o["kind"] == "Deployment")
         reordered = copy.deepcopy(deployment)

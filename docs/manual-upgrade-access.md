@@ -89,7 +89,11 @@ the twelve hooks is left from a failed run, then runs the server dry-run probes 
 its own policy's message. Close the window procedurally, with the `demo-apply`
 environment reviewer as the gate:
 
-1. Confirm that no Deploy, OpenSearch recovery or volume expansion run is in
+1. Install only a package rendered from a commit whose real Helm upgrade rehearsal
+   of the component under these grants has passed
+   ([#93](https://github.com/jaegertracing/jaeger-demo/pull/93)); the admission
+   probes alone do not show that Helm can complete the upgrade. Confirm that no
+   Deploy, OpenSearch recovery or volume expansion run is in
    progress or waiting for approval, and that `default/jaeger-demo-deployment-revisions`
    exists and is not held by a `manual/` run. Read the live Stage 1 Roles and
    bindings of the `demo-apply` user and stop if they allow creating RoleBindings

@@ -259,6 +259,14 @@ def lock_gates(rows, policies):
     return guards
 
 
+def chart_secrets(changes=NO_CHANGES):
+    """The chart-owned monitoring Secrets whose in-place update skips the history check. Only those this commit
+    still renders qualify: their named lock gate is what guards the update. A dropped or rollback-only one keeps
+    the history check, so a leftover cannot change without the lock."""
+    rows = current(changes)
+    return [n for n in r.MONITORING_SECRETS if "patch" in rows.get(("default", "", "secrets", n), {}).get("verbs", ())]
+
+
 def history(policies, changes=NO_CHANGES):
     expression = r.history_expression(HISTORY)
     # A chart Secret this commit adds may be created, and one it drops deleted, inside this lock-bearing
@@ -270,7 +278,7 @@ def history(policies, changes=NO_CHANGES):
                           + json.dumps(names) + ") || (" + expression + ")")
     guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], expression,
                       HISTORY_DENIED,
-                      condition=r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")",
+                      condition=r.CHART_SECRET_UPDATE + json.dumps(chart_secrets(changes)) + ")",
                       variables=[{"name": "records", "expression": r.HISTORY_RECORDS}])
     # The three chart-owned monitoring Secrets may change with the chart (documented residual risk);
     # the lock gate on their named patch still applies.

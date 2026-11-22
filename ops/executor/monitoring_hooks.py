@@ -170,6 +170,9 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
             # Kubernetes checks escalation for a CREATE against the collection URL, which has
             # no resourceName. Raw CREATE and UPDATE are gated independently of this extra verb.
             grant_rules[scope].append(r.rule(group, target, ["escalate"], [""]))
+            if scoped:
+                # A server-side apply that creates the role is a PATCH on its name, so escalation is checked there.
+                grant_rules[scope].append(r.rule(group, target, ["escalate"], names))
             same = ('object.rules == oldObject.rules && has(object.aggregationRule) == has(oldObject.aggregationRule) '
                     '&& (!has(object.aggregationRule) || object.aggregationRule == oldObject.aggregationRule)'
                     if target == "clusterroles" else 'object.rules == oldObject.rules')

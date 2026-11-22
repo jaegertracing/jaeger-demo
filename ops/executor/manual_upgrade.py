@@ -173,7 +173,7 @@ def at(obj, path, default=REQUIRED):
             r.require(default is not REQUIRED, "Reviewed render lacks " + "/".join(map(str, path)))
             return default
         obj = obj[key]
-    return obj
+    return default if obj is None and default is not REQUIRED else obj
 
 
 def cel(root, path):
@@ -183,7 +183,9 @@ def cel(root, path):
 def value(root, path, default):
     if default is REQUIRED:
         return "dyn(" + cel(root, path) + ")"
-    return f"({json.dumps(path[-1])} in {cel(root, path[:-1])} ? dyn({cel(root, path)}) : dyn({r.literal(default)}))"
+    # Fields without omitempty, such as Role.rules, reach admission absent, empty or null depending on the writer.
+    return (f"({json.dumps(path[-1])} in {cel(root, path[:-1])} && {cel(root, path)} != null"
+            f" ? dyn({cel(root, path)}) : dyn({r.literal(default)}))")
 
 
 def webhook_checks(count, reference):
@@ -489,11 +491,45 @@ def apply_manager(live):
     return HELM_MANAGER if HELM_MANAGER in applied else None
 
 
-def server_applied(objects, kube):
-    """For each pinned object that exists and was last server-side applied, the object the same apply of this
-    render produces: a nonpersistent `apply --server-side --dry-run=server` under the live object's manager."""
+def named(items):
+    return isinstance(items, list) and bool(items) and all(isinstance(i, dict) and "name" in i for i in items)
+
+
+def client_merged(reviewed, new, old, live):
+    """The result of Helm's client-side three-way patch (deployed manifest, this render, live object), from the
+    server-defaulted render. A field this render sets takes the reviewed value. A field the deployed manifest set
+    and this render drops is deleted, so the server defaults it again: the reviewed value. A field neither set
+    keeps its live value, such as a server default that depended on a field the upgrade changed. Lists of named
+    items merge per name, as the strategic merge patch does."""
+    if isinstance(reviewed, dict) and isinstance(live, dict):
+        new, old = (new if isinstance(new, dict) else {}), (old if isinstance(old, dict) else {})
+        merged = {}
+        for key in sorted(set(reviewed) | set(live)):
+            if key in new:
+                if key in reviewed:
+                    merged[key] = client_merged(reviewed[key], new[key], old.get(key), live.get(key))
+            elif key in old or key not in live:
+                if key in reviewed:
+                    merged[key] = copy.deepcopy(reviewed[key])
+            else:
+                merged[key] = copy.deepcopy(live[key])
+        return merged
+    if named(reviewed) and named(live):
+        by_name = {i["name"]: i for i in live}
+        new_by = {i["name"]: i for i in new} if named(new) else {}
+        old_by = {i["name"]: i for i in old} if named(old) else {}
+        merged = [client_merged(i, new_by.get(i["name"]), old_by.get(i["name"]), by_name.get(i["name"])) for i in reviewed]
+        rendered = {i["name"] for i in reviewed}
+        return merged + [copy.deepcopy(i) for i in live if i["name"] not in rendered and i["name"] not in old_by]
+    return copy.deepcopy(reviewed)
+
+
+def applied_forms(objects, defaulted, deployed, kube):
+    """For each pinned object that exists, the object Helm's upgrade of this render produces when that differs
+    from a fresh create: the server-side dry-run apply under Helm's field manager for a server-side release, or
+    client_merged() for a client-side one."""
     result = {}
-    for obj, namespace in objects:
+    for (obj, namespace), reviewed in zip(objects, defaulted):
         group, target = KINDS[obj["kind"]]
         cluster = obj["kind"].startswith("Cluster") or obj["kind"] in WEBHOOKS
         where = [] if cluster else ["-n", obj["metadata"].get("namespace", namespace)]
@@ -501,7 +537,13 @@ def server_applied(objects, kube):
         found = subprocess.run([*kube, *where, "get", resource_arg(group, target), obj["metadata"]["name"], "--ignore-not-found",
                                 "--show-managed-fields", "-o", "json"],
                                capture_output=True, timeout=30, check=True).stdout
-        manager = apply_manager(json.loads(found)) if found.strip() else None
+        live = json.loads(found) if found.strip() else None
+        manager = apply_manager(live) if live else None
+        if live and not manager:
+            key = ident(reviewed)
+            if key in deployed:
+                result[key] = client_merged(reviewed, obj, deployed[key], live)
+            continue
         if not manager:
             continue
         trial = copy.deepcopy(obj)
@@ -553,14 +595,14 @@ def identity(key, obj, namespace):
 
 
 def deployed_objects(kubeconfig, context, scratch):
-    """Identities in each release's deployed manifest. `helm get manifest` leaves out hooks."""
+    """Each release's deployed manifest by identity. `helm get manifest` leaves out hooks."""
     env = {"PATH": os.environ["PATH"], "HOME": str(scratch)}
-    found = set()
+    found = {}
     for key in RELEASE_KEYS:
         namespace, release = adapter.RELEASES[key][:2]
         manifest = subprocess.run(["helm", "get", "manifest", release, "--namespace", namespace, "--kubeconfig", kubeconfig,
                                    "--kube-context", context], env=env, capture_output=True, timeout=120, check=True).stdout
-        found |= {identity(key, obj, namespace) for obj in yaml.safe_load_all(manifest) if obj}
+        found.update({identity(key, obj, namespace): obj for obj in yaml.safe_load_all(manifest) if obj})
     return found
 
 
@@ -687,9 +729,10 @@ def render(user, charts, kubeconfig, context, scratch):
     probes, the objects the upgrade adds and drops, and the archive digests."""
     kube = ["kubectl", "--kubeconfig", kubeconfig, "--context", context, "--request-timeout=15s"]
     pinned, located, rendered = render_pinned(charts, scratch)
-    changes = release_changes(deployed_objects(kubeconfig, context, scratch), rendered)
+    deployed = deployed_objects(kubeconfig, context, scratch)
+    changes = release_changes(deployed, rendered)
     defaulted = server_defaults(pinned, kube)
-    applied = server_applied(pinned, kube)
+    applied = applied_forms(pinned, defaulted, deployed, kube)
     definitions = hooks.pinned_hooks(located["oci-monitoring"]) if "oci-monitoring" in COMPONENTS else []
     defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
     guards, granted = package(user, defaulted, defaulted_hooks, changes, applied)

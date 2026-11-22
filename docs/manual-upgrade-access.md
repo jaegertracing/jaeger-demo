@@ -61,8 +61,9 @@ python3 ops/executor/manual_upgrade.py --user "$demo_apply_user" \
 The script verifies the chart archives against `ops/executor/chart-archives.json`,
 including archives passed with `--charts`,
 renders the four releases as upgrades, compares the render with each release's
-deployed manifest (`helm get manifest`) to find the objects the upgrade adds and
-drops, and asks the API server to default a renamed
+last successful manifest (`helm get manifest` of the latest deployed or superseded
+revision, which Helm also uses when retrying after a failed upgrade) to find the
+objects the upgrade adds and drops, and asks the API server to default a renamed
 copy of each pinned object with a nonpersistent `create --dry-run=server`. Helm 4
 installs releases with server-side apply and upgrades them with the method their
 latest release record names. Either way the upgrade merges into the live object,

@@ -40,6 +40,7 @@ LITERALS = (
     ("scripts/demo/rehearsals/monitoring-writer/build_fixture.py", rf'startswith\(\s*"({VER})\+"\s*\)', "helm", 1),
     ("scripts/demo/rehearsals/monitoring-writer/rehearse.py", rf'startswith\("({VER})\+"\)', "helm", 1),
     (".github/actions/rehearse-executor/action.yml", rf"kindest/node:({VER})@", "kube", 1),
+    (".github/workflows/executor-ci.yml", rf"kindest/node:({VER})@", "kube", 1),
     ("examples/oci/monitoring-values.yaml", r'depName=registry\.k8s\.io/kubectl\s+tag: "(v\d+\.\d+\.\d+)@sha256', "kube", 1),
     ("ops/executor/monitoring_hooks.py", rf'== b"({VER})"', "helm", 1),
     ("ops/executor/monitoring_hooks.py", rf'--kube-version=({VER})"', "kube", 1),

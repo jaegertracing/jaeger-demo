@@ -434,15 +434,26 @@ class ManualUpgradeTests(unittest.TestCase):
             self.assertEqual(verify.leftover_hooks(probes, ["kubectl"]), 0)
 
     def test_installed_guards_must_match_guards_json(self):
+        for kind in ("ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"):
+            item = next(g for g in self.guards if g["kind"] == kind)
+            served = copy.deepcopy(item["spec"])
+            constraints = served.setdefault("matchConstraints" if kind.endswith("Policy") else "matchResources", {})
+            constraints.update(matchPolicy="Equivalent", namespaceSelector={}, objectSelector={})
+            for rule in constraints.get("resourceRules", []) + constraints.get("excludeResourceRules", []):
+                rule["scope"] = "*"
+            with self.subTest(kind=kind):
+                self.assertTrue(verify.matches(item["spec"], served))
+                narrowed = copy.deepcopy(served)
+                narrowed["matchConstraints" if kind.endswith("Policy") else "matchResources"]["objectSelector"] = {
+                    "matchExpressions": [{"key": "fixture.invalid/exempt", "operator": "DoesNotExist"}]}
+                self.assertFalse(verify.matches(item["spec"], narrowed))
         policy = next(g for g in self.guards if g["kind"] == "ValidatingAdmissionPolicy")
-        served = copy.deepcopy(policy)
-        served["spec"]["matchConstraints"]["matchPolicy"] = "Equivalent"
-        self.assertTrue(verify.contains(policy["spec"], served["spec"]))
-        served["spec"]["validations"][1]["expression"] = "true"
-        self.assertFalse(verify.contains(policy["spec"], served["spec"]))
-        served["spec"] = copy.deepcopy(policy["spec"])
-        served["spec"]["validations"].pop()
-        self.assertFalse(verify.contains(policy["spec"], served["spec"]))
+        changed = copy.deepcopy(policy["spec"])
+        changed["validations"][1]["expression"] = "true"
+        self.assertFalse(verify.matches(policy["spec"], changed))
+        shorter = copy.deepcopy(policy["spec"])
+        shorter["validations"].pop()
+        self.assertFalse(verify.matches(policy["spec"], shorter))
 
     def changed(self):
         """An upgrade that adds a Deployment, a ConfigMap, a hook-kind ClusterRole and a Secret, and drops two objects."""

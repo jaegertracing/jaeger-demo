@@ -13,11 +13,13 @@ refused. The administrator credential and the cluster are disposable.
 """
 
 import argparse
+import difflib
 import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -210,24 +212,45 @@ def claims(cluster):
     return {c["metadata"]["name"]: (c["metadata"]["uid"], c["spec"].get("volumeName")) for c in items}
 
 
+def explain(cluster, built, stderr):
+    """For each object a pin refused, print how the live object, the reviewed render and the reviewed
+    server-side apply differ in the pinned fields."""
+    for namespace, name, kind in re.findall(r"object (?:([a-z0-9-]+)/)?([a-z0-9.-]+) [a-z0-9./]+, Kind=(\w+)", stderr):
+        reviewed = next((o for o in built["defaulted"] if o["kind"] == kind and o["metadata"]["name"] == name
+                         and o["metadata"].get("namespace", "") == namespace), None)
+        if reviewed is None:
+            continue
+        key = m.ident(reviewed)
+        found = cluster.kube((["-n", namespace] if namespace else []) + ["get", m.resource_arg(*key[1:3]), name, "-o", "json"], check=False)
+        forms = {"reviewed": reviewed, "live": json.loads(found.stdout) if not found.returncode else None, "applied": built["applied"].get(key)}
+        text = {label: json.dumps(json.loads(m.surface(obj)), indent=1, sort_keys=True).splitlines() for label, obj in forms.items() if obj}
+        for label in ("live", "applied"):
+            if label in text:
+                print(f"--- {kind} {namespace}/{name}: reviewed vs {label}", file=sys.stderr)
+                print("\n".join(difflib.unified_diff(text["reviewed"], text[label], "reviewed", label, lineterm="", n=2)), file=sys.stderr)
+
+
 def diagnostics(cluster):
     for args in (["get", "pods", "-A", "-o", "wide"], ["get", "events", "-A", "--sort-by=.lastTimestamp"]):
         print(cluster.kube(args, check=False).stdout[-6000:], file=sys.stderr)
 
 
-def exercise(component, charts, cluster, scratch):
-    report = {"component": component, "kubelet": preflight(cluster), "baselineCommit": BASELINES[component]["commit"]}
+def exercise(component, charts, cluster, scratch, apply="server"):
+    report = {"component": component, "apply": apply, "kubelet": preflight(cluster), "baselineCommit": BASELINES[component]["commit"]}
     prepare(cluster)
     with m.selected([component]):
         head = head_inputs(component, charts)
         base = baseline_inputs(component, head, scratch, cluster)
-        run(cluster, component, base, user=False)
+        # The baseline's apply method is the one Helm's default (`--server-side auto`) reuses for the upgrade.
+        run(cluster, component, base, user=False, extra=["--server-side", "true" if apply == "server" else "false"])
         before = {spec["release"]: status(cluster, spec) for spec in COMMANDS[component]["releases"]}
         require(all(s == "deployed" for s, _ in before.values()), "Baseline install failed")
         volumes = claims(cluster) if component == "opensearch" else {}
 
         built = m.render(USER, charts, cluster.kubeconfig, cluster.context, scratch)
         changes = built["changes"]
+        require(bool(built["applied"]) == (apply == "server"),
+                f"Expected server-side apply forms only for a server-side release, found {len(built['applied'])}")
         expected = BASELINES[component]["expect"]
         require(sorted("/".join(k) for k in changes["added"]) == sorted(expected["added"])
                 and sorted("/".join(k) for k in changes["removed"]) == sorted(expected["removed"]),
@@ -246,7 +269,12 @@ def exercise(component, charts, cluster, scratch):
         holder(cluster, "manual/1/1")
         settled(cluster, component, held=True)
         started = time.monotonic()
-        run(cluster, component, head, user=True)
+        try:
+            run(cluster, component, head, user=True)
+        except RuntimeError as failure:
+            if m.PIN_DENIED in str(failure):
+                explain(cluster, built, str(failure))
+            raise
         report["upgradeSeconds"] = round(time.monotonic() - started)
         after = {spec["release"]: status(cluster, spec) for spec in COMMANDS[component]["releases"]}
         for release, (state, revision) in after.items():
@@ -269,7 +297,7 @@ def exercise(component, charts, cluster, scratch):
         settled(cluster, component, held=True)
         tampered = attempt(cluster, component, head, ["--set", COMMANDS[component]["releases"][0]["tamper"]])
         require(tampered.returncode and m.PIN_DENIED in tampered.stderr, "A tampered upgrade was not refused: " + tampered.stderr[-600:])
-    report.update(changes={k: ["/".join(x) for x in v] for k, v in changes.items()}, guards=len(built["guards"]),
+    report.update(appliedForms=len(built["applied"]), changes={k: ["/".join(x) for x in v] for k, v in changes.items()}, guards=len(built["guards"]),
                   grants=len(built["grants"]), probes=len(built["probes"]), readinessDenials=len(denied),
                   releases={k: {"before": before[k], "after": after[k]} for k in after}, opensearchClaims=len(volumes),
                   refused=["upgrade without the manual lock", "tampered pod spec"], passed=True)
@@ -279,6 +307,8 @@ def exercise(component, charts, cluster, scratch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--component", choices=m.ALL_COMPONENTS, required=True)
+    parser.add_argument("--apply", choices=("server", "client"), default="server",
+                        help="How the baseline release is applied; Helm's default upgrade reuses it")
     parser.add_argument("--charts", type=Path, required=True, help="Verified chart archives from scheduled_inputs.charts_for")
     parser.add_argument("--kubeconfig", required=True)
     parser.add_argument("--context", required=True)
@@ -287,12 +317,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="manual-upgrade-") as scratch:
         cluster = Cluster(args.kubeconfig, args.context, scratch)
         try:
-            report = exercise(args.component, args.charts.resolve(), cluster, scratch)
+            report = exercise(args.component, args.charts.resolve(), cluster, scratch, args.apply)
         except Exception:
             diagnostics(cluster)
             raise
     args.receipt.write_text(json.dumps(report, indent=2) + "\n")
-    print(f"PASS: {args.component} upgraded as the manual user; {report['readinessDenials']} readiness denials; "
+    print(f"PASS: {args.component} ({args.apply}-side apply) upgraded as the manual user; {report['readinessDenials']} readiness denials; "
           f"{len(report['changes']['added'])} added, {len(report['changes']['removed'])} dropped")
 
 

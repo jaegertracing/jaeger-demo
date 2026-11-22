@@ -89,13 +89,15 @@ jobs:
           --six-chart-approvals "$RUNNER_TEMP/chart-sources/charts" "$RUNNER_TEMP/chart-sources/upstream"
 
   manual-upgrade:
-    name: Manual upgrade as demo-apply (${{ matrix.component }})
+    name: Manual upgrade as demo-apply (${{ matrix.component }}, ${{ matrix.apply }}-side apply)
     runs-on: ubuntu-latest
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         component: [oci-monitoring, opensearch, otel-demo]
+        # Helm 4 upgrades a release with the apply method it last used, so production can be in either.
+        apply: [server, client]
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       with:
@@ -140,8 +142,9 @@ jobs:
     - name: Upgrade the component with Helm as the manual user under the guarded package
       env:
         COMPONENT: ${{ matrix.component }}
+        APPLY: ${{ matrix.apply }}
       run: |
-        python3 scripts/demo/rehearsals/manual-upgrade/rehearse.py --component "$COMPONENT" \
+        python3 scripts/demo/rehearsals/manual-upgrade/rehearse.py --component "$COMPONENT" --apply "$APPLY" \
           --charts "$RUNNER_TEMP/chart-sources/charts" --kubeconfig "$RUNNER_TEMP/fixture.yaml" \
           --context kind-jaeger-demo-manual-upgrade --receipt "$RUNNER_TEMP/manual-upgrade-receipt.json"
-        { echo "### Manual upgrade receipt ($COMPONENT)"; echo '```json'; cat "$RUNNER_TEMP/manual-upgrade-receipt.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        { echo "### Manual upgrade receipt ($COMPONENT, $APPLY-side apply)"; echo '```json'; cat "$RUNNER_TEMP/manual-upgrade-receipt.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

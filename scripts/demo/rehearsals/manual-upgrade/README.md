@@ -12,7 +12,9 @@ describes the package.
 1. The fixture administrator installs the component at its
    [baseline](baselines.json): the recorded commit's chart, fetched from the chart
    repository and checked against its SHA-256, with that commit's values. A null
-   commit installs this checkout's own pins.
+   commit installs this checkout's own pins. `--apply server` or `client` sets the
+   baseline's Helm apply method, which the manual job's upgrade (`--server-side
+   auto`, Helm's default) reuses. CI runs both.
 2. It renders the package for that component from this checkout with
    `ops/executor/manual_upgrade.py`, checks that the objects the upgrade adds and
    drops are the recorded ones, and installs the guards before the grants.
@@ -21,7 +23,9 @@ describes the package.
 4. Holding the lock as `manual/1/1`, the user runs the manual job's commands. They
    use the deploy scripts' Helm arguments, with the verified archives in place
    of repository names.
-5. The rehearsal checks that every release is deployed one revision later, that
+5. If a pin refuses the upgrade, the rehearsal prints how the live object, the
+   reviewed render and the reviewed server-side apply differ in the pinned fields.
+6. The rehearsal checks that every release is deployed one revision later, that
    added objects exist and dropped ones are gone, and that the OpenSearch claims
    keep their UIDs and volumes. It also checks that an upgrade without the lock
    and an upgrade that changes a pinned pod spec are refused.

@@ -27,8 +27,9 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
 
 - `Manual upgrade as demo-apply` CI checks upgrade monitoring, OpenSearch and the
   OTel demo with real Helm, hooks and `--wait` on a Kubernetes 1.37 kind cluster
-  as the impersonated manual user under the guarded package. They start from
-  recorded baselines, including an OTel demo upgrade that adds and drops objects.
+  as the impersonated manual user under the guarded package, for releases on
+  server-side and client-side apply. They start from recorded baselines, including
+  an OTel demo upgrade that adds and drops objects.
   `ops/executor/manual_upgrade.py --components` renders the package for only the
   components an upgrade changes.
   ([#93](https://github.com/jaegertracing/jaeger-demo/pull/93),

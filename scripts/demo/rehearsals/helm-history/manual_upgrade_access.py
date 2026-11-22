@@ -99,11 +99,14 @@ def exercise(charts, kubectl, cfg, kube):
     steady = sorted(k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement")
     probed = {"frontend", "prometheus-kube-prometheus-operator", "prometheus-kube-state-metrics"}
     added = [next(k for k in steady if k[:3] == want and k[3] not in probed)
-             for want in (("otel-demo", "apps", "deployments"), ("otel-demo", "", "configmaps"), ("cluster", m.RBAC_GROUP, "clusterroles"))]
+             for want in (("otel-demo", "apps", "deployments"), ("otel-demo", "", "configmaps"), ("cluster", m.RBAC_GROUP, "clusterroles"),
+                          ("default", "", "secrets"))]
     retired = [r.resource("v1", "ConfigMap", "fixture-retired", "otel-demo", data={"fixture": "true"}),
                r.resource(m.RBAC_GROUP + "/v1", "ClusterRoleBinding", "fixture-retired",
-                          roleRef={"apiGroup": m.RBAC_GROUP, "kind": "ClusterRole", "name": "view"}, subjects=[])]
-    removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired")]
+                          roleRef={"apiGroup": m.RBAC_GROUP, "kind": "ClusterRole", "name": "view"}, subjects=[]),
+               r.resource("v1", "Secret", "fixture-retired", "default", stringData={"fixture": "true"})]
+    removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired"),
+               ("default", "", "secrets", "fixture-retired")]
     changes = m.release_changes(set(steady) - set(added) | set(removed))
     guards, grants = m.package(USER, defaulted, defaulted_hooks, changes)
     for item in guards + grants + stage1_fixture() + retired:
@@ -226,6 +229,16 @@ def exercise(charts, kubectl, cfg, kube):
     for scope, group, target, name in removed:
         expect_allowed(f"delete of the dropped {target} {name}",
                        user((["-n", scope] if scope != "cluster" else []) + ["delete", m.resource_arg(group, target), name, "--dry-run=server"]))
+    # A dropped name is only ever deleted: recreating the retired binding as the operator role is refused,
+    # and the dropped Secret's update stays canonical-history only.
+    takeover = r.resource(m.RBAC_GROUP + "/v1", "ClusterRoleBinding", "fixture-retired",
+                          roleRef={"apiGroup": m.RBAC_GROUP, "kind": "ClusterRole", "name": "prometheus-kube-prometheus-operator"},
+                          subjects=[{"kind": "User", "apiGroup": m.RBAC_GROUP, "name": USER}])
+    expect_denied("retired ClusterRoleBinding recreated as the operator role",
+                  user(["create", "-f", "-", "--dry-run=server"], json.dumps(takeover)), "Only the twelve")
+    expect_denied("update of the dropped Secret", user(["-n", "default", "patch", "secret", "fixture-retired", "--type=merge",
+                                                        "-p", json.dumps({"stringData": {"fixture": "changed"}}), "--dry-run=server"]),
+                  m.HISTORY_DENIED)
     tampered = m.creatable(added[0], rendered[added[0]])
     tampered["spec"]["template"]["spec"]["serviceAccountName"] = "prometheus-kube-prometheus-operator"
     expect_denied("added Deployment created under another service account",

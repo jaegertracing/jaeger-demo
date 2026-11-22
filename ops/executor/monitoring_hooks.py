@@ -96,14 +96,15 @@ def hook_account_guards():
 
 
 def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_name=ARCHIVE, prefix="jaeger-demo",
-             subjects=None, account_guards=True, scoped=False, exempt=None):
+             subjects=None, account_guards=True, scoped=False, exempt_create=None, exempt_delete=None):
     """Guards and grants for the twelve hooks. The defaults render the executor's package.
 
     ops/executor/manual_upgrade.py passes its own policy builder, which matches the manual
     deploy identity and checks the manual lock in every policy, so it needs no separate lock.
     It also sets `scoped`: that identity keeps its Stage 1 Jaeger and recovery rights, so the
-    inventory and preservation policies cover only the hooks' namespace and roles. `exempt` names,
-    per (scope, group, resource), are other objects that package creates or deletes with their own guards.
+    inventory and preservation policies cover only the hooks' namespace and roles. `exempt_create` and
+    `exempt_delete` names, per (scope, group, resource), are other objects that package creates or deletes
+    with their own guards; each is admitted only for its own operation.
     """
     by_target = defaultdict(list)
     grant_rules = defaultdict(list)
@@ -139,7 +140,13 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
             binding["spec"]["paramRef"].update(namespace=r.OPS, name=archive_name)
         guards.extend([policy, binding])
     for (scope, group, target), names in sorted(by_target.items()):
-        valid = "request.name in " + json.dumps(sorted(set(names) | set((exempt or {}).get((scope, group, target), ()))))
+        valid = "request.name in " + json.dumps(sorted(names))
+        created = sorted(set(names) | set((exempt_create or {}).get((scope, group, target), ())))
+        deleted = sorted(set(names) | set((exempt_delete or {}).get((scope, group, target), ())))
+        if created != sorted(names) or deleted != sorted(names):
+            # A dropped name must never be recreated: no pin covers it.
+            valid = ('(request.operation == "CREATE" ? request.name in ' + json.dumps(created)
+                     + " : request.name in " + json.dumps(deleted) + ")")
         if scope != "cluster":
             valid = "request.namespace == 'default' && " + valid
         # The hook grants give collection create in default and at cluster scope only.

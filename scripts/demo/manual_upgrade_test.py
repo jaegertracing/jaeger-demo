@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -20,6 +21,44 @@ USER = "ocid1.user.oc1..fixture"
 UID = "11111111-2222-3333-4444-555555555555"
 HOOK_KINDS = {gvr: kind for kind, gvr in hooks.KINDS.items()}
 WRITE_VERBS = {"create", "update", "patch", "delete", "escalate", "bind", "deletecollection", "impersonate", "*"}
+
+
+# Executor package digests rendered by main at f9b54fe, before the manual package generalized the shared
+# builders. A deliberate change to an executor stage updates the digest in the same pull request.
+EXECUTOR_DIGESTS = {
+    "daily-grants": "d0044c7a4205d0d8c630ed274843b41248df0a47b85ecaceb032860dc2aa91d5",
+    "daily-guards": "562a45ad51523dbbcb78e3f4e86f7dee334c38427a6b312873aa9d67f13c1c34",
+    "history-grants": "810333a152fef969d3a29334a68af41fb04a3818094ed9d8cea659ab4bc0b6ff",
+    "history-guard": "7d9176d36eb9cf9a56b59ddc3e28b29bfede4da5c35ae80f0672a76c7cc4e76c",
+    "hook-account": "b4c586c09df985b837189e5d5b63fd67ca7436cbbe0e8e0544d7fddba4927ea8",
+    "hook-grants": "5bd7d2f5901c3557a4a364e05b5f4fa301f6d2922e25ae63af60f31828ce0ebd",
+    "hook-guards": "5488345c6d479167a4a38bf6ba720c9de877631e17b62277bf0e13b53531a7a0",
+    "reads": "cb9c056f0101a835588ea49d0cc0879552492006336a7cbec60bcc822db00245",
+    "routine-grants": "d0044c7a4205d0d8c630ed274843b41248df0a47b85ecaceb032860dc2aa91d5",
+    "routine-guards": "e34ca643c3b9324d9bc9f317215d2aa2f568d2e2665acf3771d2ed2078a98189"
+}
+EXECUTOR_HOOKS = [
+    {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "prometheus-crds-upgrade", "namespace": "default"}},
+    {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "prometheus-crds-upgrade", "namespace": "default"},
+     "binaryData": {"crds.bz2": "YQ=="}},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "prometheus-crds-upgrade"},
+     "rules": [{"apiGroups": ["x"], "resources": ["y"], "verbs": ["get"]}]},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "prometheus-crds-upgrade"},
+     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "prometheus-crds-upgrade"},
+     "subjects": [{"kind": "ServiceAccount", "name": "prometheus-crds-upgrade", "namespace": "default"}]},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+     "metadata": {"name": "prometheus-kube-prometheus-admission", "namespace": "default"}, "rules": []},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+     "metadata": {"name": "prometheus-kube-prometheus-admission", "namespace": "default"},
+     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "prometheus-kube-prometheus-admission"}, "subjects": []},
+    {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "prometheus-crds-upgrade", "namespace": "default", "uid": UID},
+     "spec": {"selector": {"matchLabels": {"batch.kubernetes.io/controller-uid": UID}},
+              "template": {"spec": {"containers": [{"name": "c", "image": "i@sha256:" + "a" * 64}]}}}},
+]
+
+
+def digest(items):
+    return hashlib.sha256(json.dumps(list(items), sort_keys=True).encode()).hexdigest()
 
 
 def fixture_object(scope, group, target, name, kind):
@@ -410,7 +449,8 @@ class ManualUpgradeTests(unittest.TestCase):
                 if key[:3] == want and want not in pick:
                     pick[want] = key
         added = sorted(pick.values())
-        removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired")]
+        removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired"),
+                   ("default", "", "secrets", "fixture-retired")]
         changes = m.release_changes(set(steady) - set(added) | set(removed))
         self.assertEqual(changes, {"added": added, "removed": sorted(removed)})
         kinds = {(k[1], k[2]): HOOK_KINDS.get((k[1], k[2])) or m.PINNED.get((k[1], k[2])) for k in added}
@@ -452,14 +492,29 @@ class ManualUpgradeTests(unittest.TestCase):
         cluster_role = next(k for k in changes["added"] if k[2] == "clusterroles")
         inventory = policies[m.PREFIX + "-hook-inventory-clusterroles"]["validations"][-1]["expression"]
         self.assertIn('"' + cluster_role[3] + '"', inventory)
-        self.assertIn('"fixture-retired"', policies[m.PREFIX + "-hook-inventory-clusterrolebindings"]["validations"][-1]["expression"])
+        # A dropped binding may be deleted but never recreated: no pin covers its content.
+        bindings = policies[m.PREFIX + "-hook-inventory-clusterrolebindings"]["validations"][-1]["expression"]
+        create_side, delete_side = bindings.split(" : ", 1)
+        self.assertTrue(create_side.startswith('(request.operation == "CREATE" ? '))
+        self.assertNotIn('"fixture-retired"', create_side)
+        self.assertIn('"fixture-retired"', delete_side)
+        self.assertNotIn('"' + cluster_role[3] + '"', inventory.split(" : ", 1)[1])
+        # Chart Secrets: create the added one and delete the dropped one inside the lock-bearing history policy;
+        # updates to either stay canonical-history only, and the condition still matches them.
         secret = next(k for k in changes["added"] if k[2] == "secrets")
-        self.assertIn('"default/' + secret[3] + '"', conditions(policies[m.PREFIX + "-history"]))
+        history = policies[m.PREFIX + "-history"]
+        self.assertEqual([c["expression"] for c in history["matchConditions"]][1:],
+                         [p.CHART_SECRET_UPDATE + json.dumps(p.MONITORING_SECRETS) + ")"])
+        self.assertIn('(request.operation == "CREATE" && (request.namespace + "/" + request.name) in ["default/' + secret[3] + '"])',
+                      history["validations"][-1]["expression"])
+        self.assertIn('(request.operation == "DELETE" && (request.namespace + "/" + request.name) in ["default/fixture-retired"])',
+                      history["validations"][-1]["expression"])
+        self.assertEqual(history["validations"][0]["message"], m.LOCK_DENIED)
         retire = [spec for name, spec in policies.items() if name.startswith(m.PREFIX + "-retire-")]
-        self.assertEqual(len(retire), 2)
+        self.assertEqual(len(retire), 3)
         self.assertTrue(all(spec["matchConstraints"]["resourceRules"][0]["operations"] == ["DELETE"] for spec in retire))
         # Unchanged executor output: the exempt names never reach the executor's own hook controls.
-        self.assertEqual(hooks.controls(self.hooks), hooks.controls(self.hooks, exempt=None))
+        self.assertEqual(hooks.controls(self.hooks), hooks.controls(self.hooks, exempt_create=None, exempt_delete=None))
 
     def test_readiness_probes_create_added_objects_and_lock_their_gates(self):
         changes, bodies = self.changed()
@@ -474,8 +529,58 @@ class ManualUpgradeTests(unittest.TestCase):
         self.assertTrue(all(x["body"]["metadata"]["name"] == m.PROBE for x in probes if x["expect"] == m.CREATE_DENIED))
         retire = [x for x in probes if x["verb"] == "delete"]
         self.assertEqual(sorted((x["namespace"] or "cluster", x["name"]) for x in retire),
-                         [("cluster", "fixture-retired"), ("otel-demo", "fixture-retired")])
+                         [("cluster", "fixture-retired"), ("default", "fixture-retired"), ("otel-demo", "fixture-retired")])
         self.assertTrue(all(x["phase"] == "unlocked" and x["expect"] == m.LOCK_DENIED for x in retire))
+
+    def test_executor_output_is_byte_identical_to_main(self):
+        found = {"reads": digest(p.read_access()), "history-guard": digest(p.history_guard()), "history-grants": digest(p.history_grants())}
+        found["routine-guards"], found["routine-grants"] = map(digest, p.regular())
+        found["daily-guards"], found["daily-grants"] = map(digest, p.regular(daily=True))
+        found["hook-guards"], found["hook-grants"] = map(digest, hooks.controls(copy.deepcopy(EXECUTOR_HOOKS)))
+        found["hook-account"] = digest(hooks.hook_account_guards())
+        self.assertEqual(found, EXECUTOR_DIGESTS)
+
+    def test_a_monitoring_upgrade_shaped_like_59_adds_and_drops_hook_kinds_in_default(self):
+        """#59 adds a dashboard ConfigMap and drops the Grafana Role and RoleBinding, all in default."""
+        steady = {k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement"}
+        dashboard = next(k for k in sorted(steady) if k[:3] == ("default", "", "configmaps"))
+        dropped = {("default", m.RBAC_GROUP, "roles", "fixture-grafana"), ("default", m.RBAC_GROUP, "rolebindings", "fixture-grafana")}
+        changes = m.release_changes(steady - {dashboard} | dropped)
+        self.assertEqual(changes, {"added": [dashboard], "removed": sorted(dropped)})
+        guards, grants = m.package(USER, self.pinned, self.hooks, changes)
+        policies = {g["metadata"]["name"]: g["spec"] for g in guards if g["kind"] == "ValidatingAdmissionPolicy"}
+        create_side, delete_side = policies[m.PREFIX + "-hook-inventory-configmaps"]["validations"][-1]["expression"].split(" : ", 1)
+        self.assertIn('"' + dashboard[3] + '"', create_side)
+        self.assertNotIn('"' + dashboard[3] + '"', delete_side)
+        for target in ("roles", "rolebindings"):
+            create_side, delete_side = policies[m.PREFIX + "-hook-inventory-" + target]["validations"][-1]["expression"].split(" : ", 1)
+            self.assertNotIn('"fixture-grafana"', create_side)
+            self.assertIn('"fixture-grafana"', delete_side)
+        self.assertFalse([n for n in policies if n.startswith(m.PREFIX + "-create-")])
+        rules = [rule for scope, rule in rules_of(grants) if scope == "default"]
+        for target in ("roles", "rolebindings"):
+            self.assertIn({"apiGroups": [m.RBAC_GROUP], "resources": [target], "verbs": ["delete", "get"],
+                           "resourceNames": ["fixture-grafana"]}, rules)
+        self.assertTrue(any(rule["resources"] == ["configmaps"] and rule["verbs"] == ["create"] for rule in rules))
+
+    def test_bind_is_granted_only_where_each_binding_lives(self):
+        scoped = {}
+        for scope, rule in rules_of(self.grants):
+            if "bind" in rule["verbs"] and rule.get("resourceNames") != [""]:
+                scoped.setdefault(scope, set()).update(rule["resourceNames"])
+        cluster_refs = {o["roleRef"]["name"] for o in self.pinned if o["kind"] == "ClusterRoleBinding"}
+        hook_roles = {h["metadata"]["name"] for h in self.hooks if h["kind"] == "ClusterRole"}
+        self.assertEqual(scoped.get("cluster", set()), cluster_refs | hook_roles)
+        for binding in (o for o in self.pinned if o["kind"] == "RoleBinding"):
+            self.assertIn(binding["roleRef"]["name"], scoped[binding["metadata"]["namespace"]])
+        # A RoleBinding to a ClusterRole needs bind in its own namespace only, never at cluster scope.
+        pinned = copy.deepcopy(self.pinned)
+        binding = next(o for o in pinned if o["kind"] == "RoleBinding")
+        binding["roleRef"] = {"apiGroup": m.RBAC_GROUP, "kind": "ClusterRole", "name": "fixture-namespaced-reference"}
+        _, grants = m.package(USER, pinned, self.hooks)
+        where = {scope for scope, rule in rules_of(grants) if "bind" in rule["verbs"]
+                 and "fixture-namespaced-reference" in rule.get("resourceNames", []) and rule["resources"] == ["clusterroles"]}
+        self.assertEqual(where, {binding["metadata"]["namespace"]})
 
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):

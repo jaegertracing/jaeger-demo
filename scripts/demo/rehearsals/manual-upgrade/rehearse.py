@@ -212,9 +212,10 @@ def claims(cluster):
     return {c["metadata"]["name"]: (c["metadata"]["uid"], c["spec"].get("volumeName")) for c in items}
 
 
-def explain(cluster, built, stderr):
+def explain(cluster, built, stderr, after=None):
     """For each object a pin refused, print how the live object, the reviewed render and the reviewed
-    server-side apply differ in the pinned fields."""
+    server-side apply differ in the pinned fields. `after` runs the same upgrade as the administrator, so the
+    live object afterwards is the result the pin refused."""
     refused = re.findall(r"object (?:([a-z0-9-]+)/)?([a-z0-9.-]+) [a-z0-9./]+, Kind=(\w+)", stderr)
     refused += [(None, name, kind) for name, kind in re.findall(r'cannot patch "([a-z0-9.-]+)" with kind (\w+)', stderr)]
     for namespace, name, kind in refused:
@@ -231,6 +232,15 @@ def explain(cluster, built, stderr):
             if label in text:
                 print(f"--- {kind} {namespace}/{name}: reviewed vs {label}", file=sys.stderr)
                 print("\n".join(difflib.unified_diff(text["reviewed"], text[label], "reviewed", label, lineterm="", n=2)), file=sys.stderr)
+    if after is None:
+        return
+    try:
+        after()
+    except RuntimeError as failure:
+        print("The administrator's upgrade failed too: " + str(failure)[-600:], file=sys.stderr)
+        return
+    print("=== After the same upgrade as the administrator, the result the pin refused:", file=sys.stderr)
+    explain(cluster, built, stderr)
 
 
 def render_drift(cluster, component, inputs, built):
@@ -305,7 +315,7 @@ def exercise(component, charts, cluster, scratch, apply="server"):
             run(cluster, component, head, user=True)
         except RuntimeError as failure:
             if m.PIN_DENIED in str(failure):
-                explain(cluster, built, str(failure))
+                explain(cluster, built, str(failure), after=lambda: run(cluster, component, head, user=False))
             raise
         report["upgradeSeconds"] = round(time.monotonic() - started)
         after = {spec["release"]: status(cluster, spec) for spec in COMMANDS[component]["releases"]}

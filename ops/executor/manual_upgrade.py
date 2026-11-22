@@ -199,6 +199,18 @@ def webhook_checks(count, reference):
     return "(" + " && ".join(parts) + ")"
 
 
+def webhooks_kept():
+    """CEL: the update keeps every stored webhook apart from a rotated caBundle, whatever their number (a chart
+    version can change it). Webhook names are unique, so equal sizes and a same-named match for each are a
+    one-to-one comparison."""
+    def size(root):
+        return f'("webhooks" in dyn({root}) && dyn({root})["webhooks"] != null ? size(dyn({root})["webhooks"]) : 0)'
+    same = (r.same_except("w", "o", ["clientConfig"]) + " && "
+            + r.same_except('dyn(w)["clientConfig"]', 'dyn(o)["clientConfig"]', ["caBundle"]))
+    return (f"{size('object')} == {size('oldObject')} && ({size('object')} == 0 || "
+            f'dyn(object)["webhooks"].all(w, dyn(oldObject)["webhooks"].exists(o, dyn(o)["name"] == dyn(w)["name"] && {same})))')
+
+
 def surface(obj):
     """The pinned field values of an object, for comparing two reviewed forms."""
     if obj["kind"] in WEBHOOKS:
@@ -219,8 +231,7 @@ def surface_expression(reviewed, *, created=False, applied=None):
     server-side apply, so the result can keep fields other managers own or a different list order."""
     kind = reviewed["kind"]
     if kind in WEBHOOKS:
-        count = len(reviewed.get("webhooks") or [])
-        keep = f'"webhooks" in dyn(oldObject) && size(dyn(oldObject)["webhooks"]) == {count} && ' + webhook_checks(count, lambda p: cel("oldObject", p))
+        keep = webhooks_kept()
     else:
         keep = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in SURFACE[kind])
     take = take_expression(reviewed)

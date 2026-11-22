@@ -727,6 +727,17 @@ class ManualUpgradeTests(unittest.TestCase):
         for flag in ("--server-side", "--dry-run=server", "--field-manager=helm", "--force-conflicts=false"):
             self.assertIn(flag, applies[0])
 
+    def test_keeping_webhooks_does_not_depend_on_the_reviewed_count(self):
+        webhook = next(o for o in self.pinned if o["kind"] in m.WEBHOOKS)
+        expression = m.surface_expression(webhook)
+        keep = expression.split(") || (", 1)[0]
+        self.assertNotIn("== 1", keep)
+        self.assertIn('dyn(object)["webhooks"].all(w, dyn(oldObject)["webhooks"].exists(o, dyn(o)["name"] == dyn(w)["name"]', keep)
+        self.assertIn('"caBundle"', keep)
+        two = copy.deepcopy(webhook)
+        two["webhooks"].append(dict(webhook["webhooks"][0], name="second.example.com"))
+        self.assertEqual(m.surface_expression(two).split(") || (", 1)[0], keep)
+
     def test_absent_empty_and_null_lists_compare_equal(self):
         role = next(o for o in self.pinned if o["kind"] == "Role")
         expression = m.surface_expression(role)

@@ -62,8 +62,10 @@ renders the four releases as upgrades, compares the render with each release's
 deployed manifest (`helm get manifest`) to find the objects the upgrade adds and
 drops, and asks the API server to default a renamed
 copy of each pinned object with a nonpersistent `create --dry-run=server`. It refuses
-a dirty checkout, a rendered privileged object without a matrix record, and a
-record the charts no longer render. Hooks are defaulted under renamed copies too,
+a dirty checkout and a rendered object without a matrix record. Records the
+charts no longer render, which the matrix keeps while a rollback target needs them,
+get no grant, pin or lock gate; if the release still has such an object, it counts
+as dropped, and the upgrade deletes it. Hooks are defaulted under renamed copies too,
 because a failed hook stays in the cluster (the chart deletes hooks only on
 success or before recreating them) and must not block the retry package. A dropped object of a kind the
 components do not render, or outside their namespaces, is refused for an operator.

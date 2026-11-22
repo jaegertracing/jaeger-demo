@@ -87,3 +87,61 @@ jobs:
         PATH="$RUNNER_TEMP/preview-bin:$PATH" python3 scripts/demo/rehearsals/helm-history/rehearse-six-release-history.py \
           --assets "$RUNNER_TEMP/controller-tools/envtest" --receipt "$RUNNER_TEMP/six-chart-approvals.json" \
           --six-chart-approvals "$RUNNER_TEMP/chart-sources/charts" "$RUNNER_TEMP/chart-sources/upstream"
+
+  manual-upgrade:
+    name: Manual upgrade as demo-apply (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [oci-monitoring, opensearch, otel-demo]
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      with:
+        persist-credentials: false
+    - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      with:
+        version: v4.3.2
+        # Fail when the published checksum is missing or does not match.
+        checksum-policy: required
+    - name: Install the YAML and crypto dependencies used in the rehearsal
+      run: python3 -m pip install -c scripts/demo/oci-cli-constraints.txt PyYAML cryptography
+    - name: Fetch the baseline commit for the component's values
+      env:
+        COMPONENT: ${{ matrix.component }}
+      run: |
+        commit=$(python3 -c 'import json, os; print(json.load(open("scripts/demo/rehearsals/manual-upgrade/baselines.json"))[os.environ["COMPONENT"]]["commit"] or "")')
+        if [ -n "$commit" ]; then git fetch --no-tags --depth=1 origin "$commit"; fi
+    - name: Fetch the reviewed chart sources and verify their digests
+      env:
+        PYTHONPATH: scripts/demo
+      run: |
+        python3 - <<'PYTHON'
+        import os
+        from pathlib import Path
+        import scheduled_inputs
+
+        staging = Path(os.environ["RUNNER_TEMP"]) / "chart-sources"
+        staging.mkdir()
+        scheduled_inputs.charts_for(Path.cwd(), staging, scheduled_inputs.public_env(staging))
+        PYTHON
+    - name: Allow the OpenSearch memory map count
+      if: matrix.component == 'opensearch'
+      run: sudo sysctl -w vm.max_map_count=262144
+    - name: Create the disposable Kubernetes 1.37 cluster
+      working-directory: ${{ runner.temp }}
+      run: |
+        curl --fail --location --silent --show-error --output kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+        echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind' | sha256sum --check
+        chmod u+x kind
+        ./kind create cluster --name jaeger-demo-manual-upgrade --kubeconfig "$RUNNER_TEMP/fixture.yaml" --wait 5m \
+          --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    - name: Upgrade the component with Helm as the manual user under the guarded package
+      env:
+        COMPONENT: ${{ matrix.component }}
+      run: |
+        python3 scripts/demo/rehearsals/manual-upgrade/rehearse.py --component "$COMPONENT" \
+          --charts "$RUNNER_TEMP/chart-sources/charts" --kubeconfig "$RUNNER_TEMP/fixture.yaml" \
+          --context kind-jaeger-demo-manual-upgrade --receipt "$RUNNER_TEMP/manual-upgrade-receipt.json"
+        { echo "### Manual upgrade receipt ($COMPONENT)"; echo '```json'; cat "$RUNNER_TEMP/manual-upgrade-receipt.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

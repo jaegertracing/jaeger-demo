@@ -45,7 +45,7 @@ class WorkflowTests(unittest.TestCase):
             for job in (yaml.safe_load(path.read_text()).get('jobs') or {}).values():
                 steps += [(path.name, step) for step in job.get('steps') or []
                           if str(step.get('uses', '')).startswith('azure/setup-helm@')]
-        self.assertEqual(['ci-deploy-demo.yml', 'ci.yml', 'executor-ci.yml'], [name for name, _ in steps])
+        self.assertEqual(['ci-deploy-demo.yml', 'ci.yml', 'executor-ci.yml', 'executor-ci.yml'], [name for name, _ in steps])
         self.assertEqual(1, len({step['uses'] for _, step in steps}))
         for name, step in steps:
             with self.subTest(workflow=name):

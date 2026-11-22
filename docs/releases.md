@@ -312,7 +312,7 @@ next 12:20 UTC preparation or with the schedule paused:
    and `otel_deploy_scope=otel-demo`. The `demo-apply` identity can upgrade the
    two Jaeger releases on its own. For monitoring, OpenSearch and the OTel sample
    application, first install the guarded package rendered from the merged commit
-   ([manual upgrade access](manual-upgrade-access.md)).
+   for that component ([manual upgrade access](manual-upgrade-access.md)).
 5. Verify the component as in step 5 of the
    [change and verification process](#change-and-verification-process). For the
    OTel sample application, confirm that <https://shop.demo.jaegertracing.io/>

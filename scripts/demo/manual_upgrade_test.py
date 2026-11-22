@@ -477,6 +477,27 @@ class ManualUpgradeTests(unittest.TestCase):
                          [("cluster", "fixture-retired"), ("otel-demo", "fixture-retired")])
         self.assertTrue(all(x["phase"] == "unlocked" and x["expect"] == m.LOCK_DENIED for x in retire))
 
+    def test_a_single_component_package_grants_nothing_on_the_others(self):
+        for component, namespace in m.COMPONENT_NAMESPACES.items():
+            with self.subTest(component=component), m.selected([component]):
+                pinned, hook_objects = fixtures()
+                guards, grants = m.package(USER, pinned, hook_objects)
+                rows = m.records()
+                self.assertEqual({row["component"] for row in rows.values()}, {component})
+                scopes = {s for s, _ in rules_of(grants)}
+                self.assertEqual({s for s, rule in rules_of(grants) if rule["resources"] == ["secrets"] and "create" in rule["verbs"]},
+                                 {namespace})
+                self.assertLessEqual(scopes, {namespace, "cluster", "kube-system", p.OPS} if component == "oci-monitoring" else {namespace, "cluster"})
+                hook_policies = [g for g in guards if g["metadata"]["name"].startswith(m.PREFIX + "-hook")]
+                self.assertEqual(bool(hook_policies), component == "oci-monitoring")
+                self.assertEqual(m.RELEASE_KEYS, m.COMPONENT_RELEASES[component])
+        self.assertEqual(m.COMPONENTS, m.ALL_COMPONENTS)
+        self.assertEqual(m.NAMESPACES, ("default", "opensearch", "otel-demo"))
+        with self.assertRaisesRegex(ValueError, "Unknown or empty"), m.selected(["jaeger"]):
+            pass
+        with m.selected(["opensearch"]), self.assertRaisesRegex(ValueError, "hooks outside"):
+            m.package(USER, [], self.hooks)
+
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):
             with self.assertRaises(ValueError):

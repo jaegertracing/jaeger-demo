@@ -1,0 +1,32 @@
+{
+  "license": "Copyright (c) 2026 The Jaeger Authors. SPDX-License-Identifier: Apache-2.0",
+  "interpretation": "The release each component starts from before the manual user upgrades it to this checkout. A null commit installs this checkout's own pins, so the upgrade changes no objects. Archives are fetched from the chart repository and must match the recorded SHA-256. Expected changes are the objects the upgrade adds and drops, as scope/apiGroup/resource/name.",
+  "oci-monitoring": {
+    "commit": null,
+    "archives": {},
+    "expect": {"added": [], "removed": []}
+  },
+  "opensearch": {
+    "commit": "751b76115373af3cb38bdf5a8af33a5a3c62c074",
+    "archives": {
+      "opensearch": {"chart": "opensearch", "version": "3.7.0", "repo": "https://opensearch-project.github.io/helm-charts",
+                     "sha256": "987e1b10fc717bee1545996c204c08a606d29bbab6b057e469923a92e7983c30"},
+      "opensearch-dashboards": {"chart": "opensearch-dashboards", "version": "3.7.0", "repo": "https://opensearch-project.github.io/helm-charts",
+                                "sha256": "bf878bfdb1004879ccac2212fe9ed6c6884de1c44cec16fc84942c3c3d515b9c"}
+    },
+    "expect": {"added": [], "removed": []}
+  },
+  "otel-demo": {
+    "commit": "c07caae42f6f28fbcf3c82293f7c4a324d7c45dc",
+    "archives": {
+      "otel-demo": {"chart": "opentelemetry-demo", "version": "0.40.9", "repo": "https://open-telemetry.github.io/opentelemetry-helm-charts",
+                    "sha256": "33a381a62b2f8c6031cdee2935103877a5958af14a1f5d985d39602b53e6e07b"}
+    },
+    "expect": {
+      "added": ["otel-demo//configmaps/product-catalog-product-catalog-otel-config", "otel-demo//services/astronomy-db",
+                "otel-demo//services/telemetry-docs", "otel-demo/apps/deployments/astronomy-db", "otel-demo/apps/deployments/telemetry-docs"],
+      "removed": ["otel-demo//services/llm", "otel-demo//services/postgresql", "otel-demo//services/product-reviews",
+                  "otel-demo/apps/deployments/llm", "otel-demo/apps/deployments/postgresql", "otel-demo/apps/deployments/product-reviews"]
+    }
+  }
+}

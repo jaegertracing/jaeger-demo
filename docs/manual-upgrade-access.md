@@ -51,10 +51,14 @@ independently verified operator context. The user name is the `User` subject of
 the existing Stage 1 apply bindings; it is an input, not a repository value.
 
 ```bash
-python3 ops/executor/manual_upgrade.py --user "$demo_apply_user" \
+python3 ops/executor/manual_upgrade.py --user "$demo_apply_user" --components oci-monitoring \
   --kubeconfig "$operator_kubeconfig" --context "$context" \
   --cluster-uid "$verified_kube_system_uid" --output "$new_review_directory"
 ```
+
+Name only the components the upgrade changes (`oci-monitoring`, `opensearch`,
+`otel-demo`; all three when omitted). The package then grants nothing on the
+others, and it renders hook controls only for `oci-monitoring`.
 
 The script verifies the chart archives against `ops/executor/chart-archives.json`,
 including archives passed with `--charts`,
@@ -176,4 +180,20 @@ that lacks three rendered objects and carries two dropped ones, it admits
 Helm-style creates of the added Deployment, ConfigMap and ClusterRole and deletes
 of the dropped objects, and denies an added Deployment under another service
 account, a ConfigMap the commit does not add and a delete of a kept object. A real
-Helm upgrade under these grants is a separate rehearsal.
+Helm upgrade under these grants is the next check.
+
+The `Manual upgrade as demo-apply` checks in `executor-ci.yml` run
+[`scripts/demo/rehearsals/manual-upgrade/rehearse.py`](../scripts/demo/rehearsals/manual-upgrade/rehearse.py)
+on a disposable Kubernetes 1.37 kind cluster, one per component. The fixture
+administrator installs the component at its [baseline](../scripts/demo/rehearsals/manual-upgrade/baselines.json),
+renders and installs the package for that component, and runs the verifier in both
+phases. Impersonating the manual user, it then runs the manual job's Helm
+commands, with real hooks, controllers and `--wait`. It checks that the releases
+are deployed one revision later, that the added objects exist and the dropped
+ones are gone, and that the OpenSearch claims keep their volumes. It also checks
+that an upgrade without the manual lock and a tampered pod spec are refused. The
+OTel demo starts from chart 0.40.9, so its upgrade adds five objects and drops
+six. OpenSearch and Dashboards start from 3.7.0. Monitoring has had one chart pin,
+so it upgrades in place until a newer pin gives it a baseline.
+`scripts/demo/manual_upgrade_rehearsal_test.py` checks the rehearsal's Helm
+arguments against the deploy scripts.

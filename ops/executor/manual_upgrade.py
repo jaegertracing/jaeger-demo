@@ -23,6 +23,7 @@ and applies the guards before the grants. See docs/manual-upgrade-access.md.
 
 import argparse
 from collections import defaultdict
+import contextlib
 import copy
 import hashlib
 import json
@@ -42,7 +43,12 @@ import scheduled_inputs
 
 ROOT = r.ROOT
 PREFIX = "jaeger-demo-manual"
-COMPONENTS = ("oci-monitoring", "opensearch", "otel-demo")
+ALL_COMPONENTS = ("oci-monitoring", "opensearch", "otel-demo")
+COMPONENT_RELEASES = {"oci-monitoring": ("oci-monitoring",), "opensearch": ("opensearch", "opensearch-dashboards"),
+                      "otel-demo": ("otel-demo",)}
+COMPONENT_NAMESPACES = {"oci-monitoring": "default", "opensearch": "opensearch", "otel-demo": "otel-demo"}
+# The components the package covers; selected() narrows them for one upgrade.
+COMPONENTS = ALL_COMPONENTS
 RELEASE_KEYS = ("oci-monitoring", "opensearch", "opensearch-dashboards", "otel-demo")
 NAMESPACES = ("default", "opensearch", "otel-demo")
 # The Secret policy matches every Secret write by the user, including its Stage 1 Jaeger history writes,
@@ -81,6 +87,22 @@ PINNED = {gvr: kind for kind, gvr in KINDS.items()}
 MAX_EXPRESSION = 48000
 # An upgrade that keeps every object needs no create or delete beyond hooks and history.
 NO_CHANGES = {"added": [], "removed": []}
+
+
+@contextlib.contextmanager
+def selected(components):
+    """Render for some components only, so an upgrade of one chart grants nothing on the others."""
+    global COMPONENTS, RELEASE_KEYS, NAMESPACES
+    chosen = tuple(c for c in ALL_COMPONENTS if c in set(components))
+    r.require(chosen and len(chosen) == len(set(components)), "Unknown or empty component selection")
+    saved = COMPONENTS, RELEASE_KEYS, NAMESPACES
+    COMPONENTS = chosen
+    RELEASE_KEYS = tuple(k for c in chosen for k in COMPONENT_RELEASES[c])
+    NAMESPACES = tuple(COMPONENT_NAMESPACES[c] for c in chosen)
+    try:
+        yield
+    finally:
+        COMPONENTS, RELEASE_KEYS, NAMESPACES = saved
 
 
 def subjects_for(user):
@@ -334,14 +356,18 @@ def grants(defaulted, subjects, changes=NO_CHANGES):
 def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
     """Return (guards, grants) for already server-defaulted pinned objects and hooks, and the objects the
     upgrade adds and removes (release_changes)."""
+    r.require("oci-monitoring" in COMPONENTS or not defaulted_hooks, "Monitoring hooks outside a monitoring package")
     subjects = subjects_for(user)
     policies = policy_builder(user)
     hook_names = hook_targets(defaulted_hooks)
     guards = (pins(defaulted, policies, set(map(tuple, changes["added"]))) + lock_gates(records(), policies)
               + history(policies, changes) + change_gates(changes, policies, hook_names))
     exempt = by_target(changes["added"] + changes["removed"])
-    hook_guards, hook_grants = hooks.controls(defaulted_hooks, policies=policies, lock=None, archive_name=ARCHIVE,
-                                              prefix=PREFIX, subjects=subjects, account_guards=False, scoped=True, exempt=exempt)
+    hook_guards, hook_grants = [], []
+    if "oci-monitoring" in COMPONENTS:
+        hook_guards, hook_grants = hooks.controls(defaulted_hooks, policies=policies, lock=None, archive_name=ARCHIVE, prefix=PREFIX,
+                                                  subjects=subjects, account_guards=False, scoped=True, exempt=exempt)
+
     return guards + hook_guards, grants(defaulted, subjects, changes) + hook_grants
 
 
@@ -573,9 +599,26 @@ def clean_commit():
     return head
 
 
+def render(user, charts, kubeconfig, context, scratch):
+    """The package for the selected components against the cluster's deployed releases: guards, grants,
+    probes, the objects the upgrade adds and drops, and the archive digests."""
+    kube = ["kubectl", "--kubeconfig", kubeconfig, "--context", context, "--request-timeout=15s"]
+    pinned, located, rendered = render_pinned(charts, scratch)
+    changes = release_changes(deployed_objects(kubeconfig, context, scratch))
+    defaulted = server_defaults(pinned, kube)
+    definitions = hooks.pinned_hooks(located["oci-monitoring"]) if "oci-monitoring" in COMPONENTS else []
+    defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
+    guards, granted = package(user, defaulted, defaulted_hooks, changes)
+    return {"guards": guards, "grants": granted, "changes": changes, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
+            "probes": readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]}),
+            "archives": {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--user", required=True, help="Kubernetes user name of the demo-apply credential (not committed)")
+    parser.add_argument("--components", nargs="+", choices=ALL_COMPONENTS, default=list(ALL_COMPONENTS),
+                        help="Only the components this upgrade changes (default: all three)")
     parser.add_argument("--charts", type=Path, help="Verified chart archives from scheduled_inputs.charts_for; fetched when omitted")
     parser.add_argument("--kubeconfig", required=True)
     parser.add_argument("--context", required=True)
@@ -589,30 +632,24 @@ def main():
                            text=True, capture_output=True, timeout=25, check=True).stdout
     r.require(found == args.cluster_uid and bool(found), "Cluster identity mismatch")
     kube_version = json.loads(r.MATRIX.read_bytes())["targetKubernetes"]
-    with tempfile.TemporaryDirectory(prefix="manual-upgrade-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="manual-upgrade-") as scratch, selected(args.components):
         charts = args.charts
         if charts is None:
             staging = Path(scratch) / "sources"
             staging.mkdir()
             scheduled_inputs.charts_for(ROOT, staging, scheduled_inputs.public_env(staging))
             charts = staging / "charts"
-        pinned, located, rendered = render_pinned(charts, scratch)
-        changes = release_changes(deployed_objects(args.kubeconfig, args.context, scratch))
-        defaulted = server_defaults(pinned, kube)
-        definitions = hooks.pinned_hooks(located["oci-monitoring"])
-        defaulted_hooks = dry_admitted_hooks(definitions, kube)
-        guards, granted = package(args.user, defaulted, defaulted_hooks, changes)
-        probes = readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]})
-        archives = {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}
+        built = render(args.user, charts, args.kubeconfig, args.context, scratch)
+    changes = built["changes"]
     args.output.mkdir(mode=0o700)
-    summary = {"configurationSHA": commit, "clusterUID": args.cluster_uid, "kubernetes": kube_version,
-               "chartArchiveSHA256": archives, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
-               "guards": len(guards), "grants": len(granted), "probes": len(probes),
+    summary = {"configurationSHA": commit, "clusterUID": args.cluster_uid, "kubernetes": kube_version, "components": args.components,
+               "chartArchiveSHA256": built["archives"], "pinnedObjects": built["pinnedObjects"], "hooks": built["hooks"],
+               "guards": len(built["guards"]), "grants": len(built["grants"]), "probes": len(built["probes"]),
                "added": ["/".join(k) for k in changes["added"]], "removed": ["/".join(k) for k in changes["removed"]],
                "order": "Apply guards.json, then grants.json. Remove grants.json before guards.json."}
-    for name, items in (("guards", guards), ("grants", granted)):
-        (args.output / (name + ".json")).write_bytes(adapter.encode({"apiVersion": "v1", "kind": "List", "items": items}))
-    (args.output / "probes.json").write_text(json.dumps(probes, indent=1) + "\n")
+    for name in ("guards", "grants"):
+        (args.output / (name + ".json")).write_bytes(adapter.encode({"apiVersion": "v1", "kind": "List", "items": built[name]}))
+    (args.output / "probes.json").write_text(json.dumps(built["probes"], indent=1) + "\n")
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 

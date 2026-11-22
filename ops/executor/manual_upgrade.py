@@ -253,14 +253,17 @@ def lock_gates(rows, policies):
 
 
 def history(policies, changes=NO_CHANGES):
-    condition = r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")"
-    # A chart Secret this commit adds or drops is created or deleted under the create and retire gates instead.
-    changed = sorted(k[0] + "/" + k[3] for k in changes["added"] + changes["removed"] if k[1:3] == ("", "secrets"))
-    if changed:
-        condition += ' && !((request.namespace + "/" + request.name) in ' + json.dumps(changed) + ")"
-    guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], r.history_expression(HISTORY),
+    expression = r.history_expression(HISTORY)
+    # A chart Secret this commit adds may be created, and one it drops deleted, inside this lock-bearing
+    # policy. Every other write to them, an update included, must still be a canonical history record.
+    for operation, keys in (("DELETE", changes["removed"]), ("CREATE", changes["added"])):
+        names = sorted(k[0] + "/" + k[3] for k in keys if k[1:3] == ("", "secrets"))
+        if names:
+            expression = (f'(request.operation == "{operation}" && (request.namespace + "/" + request.name) in '
+                          + json.dumps(names) + ") || (" + expression + ")")
+    guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], expression,
                       HISTORY_DENIED,
-                      condition=condition,
+                      condition=r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")",
                       variables=[{"name": "records", "expression": r.HISTORY_RECORDS}])
     # The three chart-owned monitoring Secrets may change with the chart (documented residual risk);
     # the lock gate on their named patch still applies.
@@ -329,7 +332,10 @@ def grants(defaulted, subjects, changes=NO_CHANGES):
     for obj in defaulted:
         if obj["kind"] in ("RoleBinding", "ClusterRoleBinding"):
             ref = obj["roleRef"]
-            scope = "cluster" if ref["kind"] == "ClusterRole" else ident(obj)[0]
+            # Kubernetes checks bind in the binding's own namespace, so a RoleBinding to a ClusterRole needs
+            # bind there only. Cluster scope would let any other binding grant, such as one Stage 1 can
+            # create in jaeger, reference the ClusterRole.
+            scope = ident(obj)[0]
             bind[scope, "clusterroles" if ref["kind"] == "ClusterRole" else "roles"].add(ref["name"])
     for (scope, target), names in sorted(bind.items()):
         rules[scope].append(r.rule(RBAC_GROUP, target, ["bind"], names))
@@ -362,12 +368,11 @@ def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
     hook_names = hook_targets(defaulted_hooks)
     guards = (pins(defaulted, policies, set(map(tuple, changes["added"]))) + lock_gates(records(), policies)
               + history(policies, changes) + change_gates(changes, policies, hook_names))
-    exempt = by_target(changes["added"] + changes["removed"])
     hook_guards, hook_grants = [], []
     if "oci-monitoring" in COMPONENTS:
         hook_guards, hook_grants = hooks.controls(defaulted_hooks, policies=policies, lock=None, archive_name=ARCHIVE, prefix=PREFIX,
-                                                  subjects=subjects, account_guards=False, scoped=True, exempt=exempt)
-
+                                                  subjects=subjects, account_guards=False, scoped=True,
+                                                  exempt_create=by_target(changes["added"]), exempt_delete=by_target(changes["removed"]))
     return guards + hook_guards, grants(defaulted, subjects, changes) + hook_grants
 
 

@@ -46,8 +46,10 @@ recovery script's ConfigMaps keep working.
 
 ## Render and review
 
-Run from a clean checkout of the reviewed commit, with Helm 4.3.2, PyYAML and an
-independently verified operator context. The user name is the `User` subject of
+Run from a clean checkout of the reviewed commit, with Helm 4.3.2, PyYAML,
+`jaeger-helm-preview` on `PATH` (build it with `go build -mod=readonly -o
+"$bin/jaeger-helm-preview" .` in `ops/executor/preview`, or pass `--preview-helper`)
+and an independently verified operator context. The user name is the `User` subject of
 the existing Stage 1 apply bindings; it is an input, not a repository value.
 
 ```bash
@@ -62,15 +64,16 @@ renders the four releases as upgrades, compares the render with each release's
 deployed manifest (`helm get manifest`) to find the objects the upgrade adds and
 drops, and asks the API server to default a renamed
 copy of each pinned object with a nonpersistent `create --dry-run=server`. Helm 4
-installs releases with server-side apply and upgrades them with the method they
-last used. A server-side apply merges into the live object, so it can keep fields
-other managers own or another list order. For each pinned object last applied
-that way, the script also runs a nonpersistent `apply --server-side --dry-run=server`
-of the render under the same field manager. A client-side upgrade is a three-way
-patch that keeps any field neither the deployed manifest nor the render sets, such
-as a server default that depended on a changed image tag. For those releases the
-script computes that patch's result from the deployed manifest, the render and the
-live object. The pin admits the fresh render or the upgrade's result. Absent, empty
+installs releases with server-side apply and upgrades them with the method their
+latest release record names. Either way the upgrade merges into the live object,
+so the result can keep fields a fresh create would not, such as a server default
+that depended on a changed image tag. For each pinned object the release already
+has, the script previews Helm's upgrade with a nonpersistent server dry-run, as the
+executor does: an `apply --server-side` under Helm's field manager, or the patch
+Helm 4.3.2 computes client-side (a three-way strategic merge for built-in kinds, a
+two-way JSON merge for custom resources), from
+[`jaeger-helm-preview`](../ops/executor/preview/main.go). The pin admits the fresh
+render or the previewed result. Absent, empty
 and null lists compare equal, since Kubernetes stores some fields, such as
 `Role.rules`, in any of those forms. It refuses
 a dirty checkout and a rendered object without a matrix record. Records the

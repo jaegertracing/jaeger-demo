@@ -467,7 +467,9 @@ def server_applied(objects, kube):
         group, target = KINDS[obj["kind"]]
         cluster = obj["kind"].startswith("Cluster") or obj["kind"] in WEBHOOKS
         where = [] if cluster else ["-n", obj["metadata"].get("namespace", namespace)]
-        found = subprocess.run([*kube, *where, "get", resource_arg(group, target), obj["metadata"]["name"], "--ignore-not-found", "-o", "json"],
+        # kubectl leaves managedFields out of its output unless asked.
+        found = subprocess.run([*kube, *where, "get", resource_arg(group, target), obj["metadata"]["name"], "--ignore-not-found",
+                                "--show-managed-fields", "-o", "json"],
                                capture_output=True, timeout=30, check=True).stdout
         manager = apply_manager(json.loads(found)) if found.strip() else None
         if not manager:

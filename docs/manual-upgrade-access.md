@@ -138,7 +138,8 @@ itself, so an operator can recreate it.
 - Stage 1 already lets the user patch `deployments/jaeger` in `default`
   ([cutover.md](cutover.md)). That Deployment shares the namespace with the
   prometheus-operator service account, so it can be switched to run as that account.
-  This package does not widen or close that path; it is tracked separately.
+  This package does not widen or close that path. It is an accepted risk: every
+  `demo-apply` run needs reviewer approval and runs reviewed code from `main`.
 - While the package is installed, the user cannot create or delete a ServiceAccount,
   ConfigMap, Role, RoleBinding or Job in `default` other than the reviewed hooks. A
   Jaeger chart version that adds such an object in `default` needs the package

@@ -215,12 +215,15 @@ def claims(cluster):
 def explain(cluster, built, stderr):
     """For each object a pin refused, print how the live object, the reviewed render and the reviewed
     server-side apply differ in the pinned fields."""
-    for namespace, name, kind in re.findall(r"object (?:([a-z0-9-]+)/)?([a-z0-9.-]+) [a-z0-9./]+, Kind=(\w+)", stderr):
+    refused = re.findall(r"object (?:([a-z0-9-]+)/)?([a-z0-9.-]+) [a-z0-9./]+, Kind=(\w+)", stderr)
+    refused += [(None, name, kind) for name, kind in re.findall(r'cannot patch "([a-z0-9.-]+)" with kind (\w+)', stderr)]
+    for namespace, name, kind in refused:
         reviewed = next((o for o in built["defaulted"] if o["kind"] == kind and o["metadata"]["name"] == name
-                         and o["metadata"].get("namespace", "") == namespace), None)
+                         and (namespace is None or o["metadata"].get("namespace", "") == namespace)), None)
         if reviewed is None:
             continue
         key = m.ident(reviewed)
+        namespace = reviewed["metadata"].get("namespace", "")
         found = cluster.kube((["-n", namespace] if namespace else []) + ["get", m.resource_arg(*key[1:3]), name, "-o", "json"], check=False)
         forms = {"reviewed": reviewed, "live": json.loads(found.stdout) if not found.returncode else None, "applied": built["applied"].get(key)}
         text = {label: json.dumps(json.loads(m.surface(obj)), indent=1, sort_keys=True).splitlines() for label, obj in forms.items() if obj}
@@ -228,6 +231,32 @@ def explain(cluster, built, stderr):
             if label in text:
                 print(f"--- {kind} {namespace}/{name}: reviewed vs {label}", file=sys.stderr)
                 print("\n".join(difflib.unified_diff(text["reviewed"], text[label], "reviewed", label, lineterm="", n=2)), file=sys.stderr)
+
+
+def render_drift(cluster, component, inputs, built):
+    """Report pinned objects whose offline review render differs from Helm's own render against this cluster
+    (`--dry-run=server`, which resolves lookups and the cluster's API capabilities)."""
+    drift = []
+    for spec in COMMANDS[component]["releases"]:
+        archive, values = inputs[spec["release"]]
+        args = [a for a in spec["args"] if a not in ("--wait", "--create-namespace")]
+        if "--timeout" in args:
+            del args[args.index("--timeout"):args.index("--timeout") + 2]
+        found = cluster.helm([*args, spec["release"], str(archive), "-f", str(values), "--dry-run=server", "-o", "json"], check=False)
+        if found.returncode:
+            print(f"render drift: Helm dry-run failed for {spec['release']}: {found.stderr[-400:]}", file=sys.stderr)
+            continue
+        for obj in yaml.safe_load_all(json.loads(found.stdout).get("manifest", "")):
+            if not obj or obj.get("kind") not in m.SURFACE and obj.get("kind") not in m.WEBHOOKS:
+                continue
+            key = m.identity(next(k for k in m.RELEASE_KEYS if m.adapter.RELEASES[k][1] == spec["release"]), obj, spec["namespace"])
+            offline = built["rendered"].get(key)
+            if offline is not None and m.surface(offline) != m.surface(obj):
+                drift.append("/".join(key))
+                print(f"--- render drift {'/'.join(key)}: review render vs Helm against the cluster", file=sys.stderr)
+                a, b = (json.dumps(json.loads(m.surface(o)), indent=1, sort_keys=True).splitlines() for o in (offline, obj))
+                print("\n".join(difflib.unified_diff(a, b, "review", "cluster", lineterm="", n=2)), file=sys.stderr)
+    return drift
 
 
 def diagnostics(cluster):
@@ -251,6 +280,7 @@ def exercise(component, charts, cluster, scratch, apply="server"):
 
         built = m.render(USER, charts, cluster.kubeconfig, cluster.context, scratch)
         changes = built["changes"]
+        report["renderDrift"] = render_drift(cluster, component, head, built)
         require(bool(built["applied"]) == (apply == "server"),
                 f"Expected server-side apply forms only for a server-side release, found {len(built['applied'])}")
         expected = BASELINES[component]["expect"]

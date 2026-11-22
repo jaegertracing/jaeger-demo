@@ -689,7 +689,7 @@ def render(user, charts, kubeconfig, context, scratch):
     defaulted_hooks = dry_admitted_hooks(definitions, kube) if definitions else []
     guards, granted = package(user, defaulted, defaulted_hooks, changes, applied)
     return {"guards": guards, "grants": granted, "changes": changes, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
-            "defaulted": defaulted, "applied": applied,
+            "defaulted": defaulted, "applied": applied, "rendered": rendered,
             "probes": readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]}),
             "archives": {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}}
 

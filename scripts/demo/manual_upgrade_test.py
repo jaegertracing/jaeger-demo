@@ -648,6 +648,7 @@ class ManualUpgradeTests(unittest.TestCase):
         self.assertEqual(len(apply_calls), 1)
         for flag in ("--server-side", "--dry-run=server", "--field-manager=helm"):
             self.assertIn(flag, apply_calls[0])
+        self.assertTrue(all("--show-managed-fields" in c for c in calls if "get" in c))
 
     def test_added_objects_can_be_created_by_server_side_apply(self):
         changes, _ = self.changed()

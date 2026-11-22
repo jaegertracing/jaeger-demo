@@ -638,14 +638,44 @@ class ManualUpgradeTests(unittest.TestCase):
             body["metadata"]["uid"] = UID
             return subprocess.CompletedProcess(argv, 0, json.dumps(body).encode(), b"")
 
+        deployed = {m.ident(o): o for o in objects}
         with mock.patch.object(m.subprocess, "run", side_effect=fake):
-            applied = m.server_applied([(o, o["metadata"]["namespace"]) for o in objects], ["kubectl"])
-        self.assertEqual(list(applied), [m.ident(objects[0])])
+            applied = m.applied_forms([(o, o["metadata"]["namespace"]) for o in objects], objects, deployed, ["kubectl"])
+        # Server-side: a dry-run apply. Client-side: the three-way merge, with no API call. Absent: nothing.
+        self.assertEqual(sorted(applied), sorted([m.ident(objects[0]), m.ident(objects[1])]))
         apply_calls = [c for c in calls if "apply" in c]
         self.assertEqual(len(apply_calls), 1)
         for flag in ("--server-side", "--dry-run=server", "--field-manager=helm"):
             self.assertIn(flag, apply_calls[0])
         self.assertTrue(all("--show-managed-fields" in c for c in calls if "get" in c))
+
+    def test_client_side_merge_keeps_only_defaults_helm_never_set(self):
+        def container(**fields):
+            return {"name": "c", "image": "registry.example/c@sha256:" + "a" * 64, **fields}
+
+        def pod(containers, **fields):
+            return {"kind": "Deployment", "spec": {"template": {"spec": {"containers": containers, **fields}}}}
+        new = pod([container(env=[{"name": "NEW", "value": "1"}])])
+        reviewed = pod([container(env=[{"name": "NEW", "value": "1"}], imagePullPolicy="IfNotPresent")], dnsPolicy="ClusterFirst")
+        live = pod([container(env=[{"name": "GONE", "value": "0"}, {"name": "OTHER", "value": "x"}], imagePullPolicy="Always")],
+                   dnsPolicy="ClusterFirst")
+        old = pod([container(env=[{"name": "GONE", "value": "0"}])])
+        merged = m.client_merged(reviewed, new, old, live)["spec"]["template"]["spec"]
+        # The defaulted pull policy neither manifest set stays; the dropped env var goes; another writer's stays.
+        self.assertEqual(merged["containers"][0]["imagePullPolicy"], "Always")
+        self.assertEqual([e["name"] for e in merged["containers"][0]["env"]], ["NEW", "OTHER"])
+        # A field the deployed manifest set and the render drops is deleted and defaulted again.
+        old["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = "Always"
+        merged = m.client_merged(reviewed, new, old, live)["spec"]["template"]["spec"]
+        self.assertEqual(merged["containers"][0]["imagePullPolicy"], "IfNotPresent")
+        self.assertEqual(m.client_merged(reviewed, new, old, None), reviewed)
+
+    def test_absent_empty_and_null_lists_compare_equal(self):
+        role = next(o for o in self.pinned if o["kind"] == "Role")
+        expression = m.surface_expression(role)
+        self.assertIn('"rules" in dyn(object) && dyn(object)["rules"] != null ? dyn(dyn(object)["rules"]) : dyn([])', expression)
+        self.assertEqual(m.at({"rules": None}, ("rules",), []), [])
+        self.assertEqual(m.surface({"kind": "Role", "rules": None}), m.surface({"kind": "Role"}))
 
     def test_added_objects_can_be_created_by_server_side_apply(self):
         changes, _ = self.changed()

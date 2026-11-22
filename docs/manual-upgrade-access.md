@@ -66,7 +66,13 @@ installs releases with server-side apply and upgrades them with the method they
 last used. A server-side apply merges into the live object, so it can keep fields
 other managers own or another list order. For each pinned object last applied
 that way, the script also runs a nonpersistent `apply --server-side --dry-run=server`
-of the render under the same field manager. The pin then admits either result. It refuses
+of the render under the same field manager. A client-side upgrade is a three-way
+patch that keeps any field neither the deployed manifest nor the render sets, such
+as a server default that depended on a changed image tag. For those releases the
+script computes that patch's result from the deployed manifest, the render and the
+live object. The pin admits the fresh render or the upgrade's result. Absent, empty
+and null lists compare equal, since Kubernetes stores some fields, such as
+`Role.rules`, in any of those forms. It refuses
 a dirty checkout and a rendered object without a matrix record. Records the
 charts no longer render, which the matrix keeps while a rollback target needs them,
 get no grant, pin or lock gate; if the release still has such an object, it counts

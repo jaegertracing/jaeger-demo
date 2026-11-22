@@ -131,6 +131,25 @@ def holder(cluster, value):
     cluster.kube(["-n", "default", "annotate", "configmap", r.CHECKPOINT, "--overwrite", *annotation])
 
 
+def settled(cluster, component, held, seconds=120):
+    """Admission reads the checkpoint through an informer cache. Before a Helm attempt that depends on the lock
+    state, retry a side-effect-free server dry-run create of a canonical history record for the component's first
+    release until admission reflects the state: admitted when held, denied for the lock when not. Helm itself is
+    never retried, since a failed attempt can persist release history."""
+    spec = COMMANDS[component]["releases"][0]
+    record = r.resource("v1", "Secret", f"sh.helm.release.v1.{spec['release']}.v999", spec["namespace"],
+                        type="helm.sh/release.v1", data={"release": "c2V0dGxlZA=="})
+    record["metadata"]["labels"] = {"owner": "helm", "name": spec["release"], "version": "999", "status": "pending-upgrade"}
+    deadline = time.monotonic() + seconds
+    while True:
+        result = cluster.kube(["create", "-f", "-", "--dry-run=server"], body=json.dumps(record), user=True, check=False)
+        if (not result.returncode) if held else (result.returncode and m.LOCK_DENIED in result.stderr):
+            return
+        require(time.monotonic() < deadline, f"Admission did not reflect the {'held' if held else 'released'} lock: "
+                + (result.stderr or "admitted")[-400:])
+        time.sleep(1)
+
+
 def baseline_inputs(component, head, scratch, cluster):
     """Chart archive and values file per release for the baseline install."""
     base = BASELINES[component]
@@ -225,6 +244,7 @@ def exercise(component, charts, cluster, scratch):
 
         # The approved run holds the lock as manual/<run>/<attempt>.
         holder(cluster, "manual/1/1")
+        settled(cluster, component, held=True)
         started = time.monotonic()
         run(cluster, component, head, user=True)
         report["upgradeSeconds"] = round(time.monotonic() - started)
@@ -238,6 +258,7 @@ def exercise(component, charts, cluster, scratch):
 
         # Without the manual lock the same upgrade is refused before anything is written.
         holder(cluster, None)
+        settled(cluster, component, held=False)
         refused = attempt(cluster, component, head)
         require(refused.returncode and m.LOCK_DENIED in refused.stderr, "An upgrade without the manual lock was not refused: "
                 + refused.stderr[-600:])
@@ -245,6 +266,7 @@ def exercise(component, charts, cluster, scratch):
                 "The refused upgrade changed the release")
         # A values change that alters a pinned pod spec is refused under the lock.
         holder(cluster, "manual/1/2")
+        settled(cluster, component, held=True)
         tampered = attempt(cluster, component, head, ["--set", COMMANDS[component]["releases"][0]["tamper"]])
         require(tampered.returncode and m.PIN_DENIED in tampered.stderr, "A tampered upgrade was not refused: " + tampered.stderr[-600:])
     report.update(changes={k: ["/".join(x) for x in v] for k, v in changes.items()}, guards=len(built["guards"]),

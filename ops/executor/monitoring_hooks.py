@@ -96,13 +96,14 @@ def hook_account_guards():
 
 
 def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_name=ARCHIVE, prefix="jaeger-demo",
-             subjects=None, account_guards=True, scoped=False):
+             subjects=None, account_guards=True, scoped=False, exempt=None):
     """Guards and grants for the twelve hooks. The defaults render the executor's package.
 
     ops/executor/manual_upgrade.py passes its own policy builder, which matches the manual
     deploy identity and checks the manual lock in every policy, so it needs no separate lock.
     It also sets `scoped`: that identity keeps its Stage 1 Jaeger and recovery rights, so the
-    inventory and preservation policies cover only the hooks' namespace and roles.
+    inventory and preservation policies cover only the hooks' namespace and roles. `exempt` names,
+    per (scope, group, resource), are other objects that package creates or deletes with their own guards.
     """
     by_target = defaultdict(list)
     grant_rules = defaultdict(list)
@@ -138,7 +139,7 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
             binding["spec"]["paramRef"].update(namespace=r.OPS, name=archive_name)
         guards.extend([policy, binding])
     for (scope, group, target), names in sorted(by_target.items()):
-        valid = "request.name in " + json.dumps(sorted(names))
+        valid = "request.name in " + json.dumps(sorted(set(names) | set((exempt or {}).get((scope, group, target), ()))))
         if scope != "cluster":
             valid = "request.namespace == 'default' && " + valid
         # The hook grants give collection create in default and at cluster scope only.
@@ -159,7 +160,8 @@ def controls(objects, *, policies=r.policies, lock=r.checkpoint_lock, archive_na
                     if target == "clusterroles" else 'object.rules == oldObject.rules')
             same += " && has(object.metadata.labels) == has(oldObject.metadata.labels) && (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels)"
             # Scoped, the manual package's per-object pins admit reviewed rule changes on other roles.
-            hook_roles = (valid if scope != "cluster" else "request.name in " + json.dumps(sorted(names))) if scoped else None
+            only = "request.name in " + json.dumps(sorted(names))
+            hook_roles = (only if scope == "cluster" else "request.namespace == 'default' && " + only) if scoped else None
             guards.extend(policies(prefix + "-hook-preserve-" + target, group, target, ["UPDATE"], same,
                                    "Existing RBAC rules and aggregation must be preserved", condition=hook_roles))
     if account_guards:

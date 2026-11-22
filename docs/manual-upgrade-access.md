@@ -29,9 +29,9 @@ renders two lists from the reviewed commit:
 
 | File | Contents |
 | --- | --- |
-| `guards.json` | ValidatingAdmissionPolicies that match only the `demo-apply` Kubernetes user, fail closed, and deny every write unless `default/jaeger-demo-deployment-revisions` is held by a manual run (`manual/<run>/<attempt>`). Each object that carries privilege must keep its current security surface or take exactly the one in this commit's server-defaulted render: Role and ClusterRole rules, ClusterRole labels (an `aggregationRule` such as `view`'s copies the rules of every ClusterRole whose labels it selects), binding subjects and role references, the pod spec of every Deployment, DaemonSet and StatefulSet, the `Prometheus` and `Alertmanager` specs the operator turns into pods, Service type, `externalIPs` and `externalName`, and admission webhooks apart from the rotated `caBundle`. A StatefulSet's storage identity (claim templates, PVC retention policy, selector, service name and replica count) must stay as it is, whatever the pod spec does, because a `Delete` retention policy with fewer replicas lets the controller delete data volumes. The twelve monitoring hooks must match the reviewed hooks exactly, as for the executor. Secret writes must be canonical Helm history records of the six releases, except the three chart-owned monitoring Secrets. |
-| `probes.json` | Server dry-run probes for `manual_upgrade_verify.py`, one per pin, hook, hook inventory target, history namespace and lock gate. |
-| `grants.json` | Roles bound to the same user: named `get,patch` on the reviewed matrix records of the three components, named `escalate` and `bind` on the chart's existing roles, the hook lifecycle verbs, history Secret writes in `default`, `opensearch` and `otel-demo`, and the reads Helm's `--wait` needs. No namespace, storage, CRD, exec or port-forward rights. |
+| `guards.json` | ValidatingAdmissionPolicies that match only the `demo-apply` Kubernetes user, fail closed, and deny every write unless `default/jaeger-demo-deployment-revisions` is held by a manual run (`manual/<run>/<attempt>`). Each object that carries privilege must keep its current security surface or take exactly the one in this commit's server-defaulted render: Role and ClusterRole rules, ClusterRole labels (an `aggregationRule` such as `view`'s copies the rules of every ClusterRole whose labels it selects), binding subjects and role references, the pod spec of every Deployment, DaemonSet and StatefulSet, the `Prometheus` and `Alertmanager` specs the operator turns into pods, Service type, `externalIPs` and `externalName`, and admission webhooks apart from the rotated `caBundle`. A StatefulSet's storage identity (claim templates, PVC retention policy, selector, service name and replica count) must stay as it is, whatever the pod spec does, because a `Delete` retention policy with fewer replicas lets the controller delete data volumes. The twelve monitoring hooks must match the reviewed hooks exactly, as for the executor. Secret writes must be canonical Helm history records of the six releases, except the three chart-owned monitoring Secrets. When the upgrade adds objects, creates are admitted only for those names (and the hooks), and each added privileged object must be created with exactly the reviewed surface. Deletes of the objects it drops need the lock. |
+| `probes.json` | Server dry-run probes for `manual_upgrade_verify.py`, one per pin, hook, hook inventory target, create gate, history namespace and lock gate. An added object is probed with a create, since it does not exist yet. |
+| `grants.json` | Roles bound to the same user: named `get,patch` on the reviewed matrix records of the three components, named `escalate` and `bind` on the chart's existing roles, the hook lifecycle verbs, history Secret writes in `default`, `opensearch` and `otel-demo`, and the reads Helm's `--wait` needs. When the upgrade changes the object set: `create` on the added objects' kinds in their namespaces (RBAC cannot name a created object), with create-time `escalate` where roles are added, and named `get,delete` on the objects it drops. No namespace, storage, CRD, exec or port-forward rights. |
 
 The executor's own policies match only its service account and a running daily
 request, so the two packages do not overlap. Their object names share no prefix
@@ -58,13 +58,17 @@ python3 ops/executor/manual_upgrade.py --user "$demo_apply_user" \
 
 The script verifies the chart archives against `ops/executor/chart-archives.json`,
 including archives passed with `--charts`,
-renders the four releases as upgrades, and asks the API server to default a renamed
+renders the four releases as upgrades, compares the render with each release's
+deployed manifest (`helm get manifest`) to find the objects the upgrade adds and
+drops, and asks the API server to default a renamed
 copy of each pinned object with a nonpersistent `create --dry-run=server`. It refuses
 a dirty checkout, a rendered privileged object without a matrix record, and a
 record the charts no longer render. Hooks are defaulted under renamed copies too,
 because a failed hook stays in the cluster (the chart deletes hooks only on
-success or before recreating them) and must not block the retry package. `summary.json` records the commit, the archive
-digests and the object counts. Review `grants.json` in full before installing it.
+success or before recreating them) and must not block the retry package. A dropped object of a kind the
+components do not render, or outside their namespaces, is refused for an operator.
+`summary.json` records the commit, the archive digests, the object counts and the
+added and dropped objects. Review `grants.json` in full before installing it.
 
 ## Install, use and remove
 
@@ -123,6 +127,9 @@ itself, so an operator can recreate it.
 
 ## Residual risk
 
+- Objects an upgrade adds are created with the same content limits as patches:
+  privileged kinds take the reviewed surface, and other kinds are limited by name
+  only.
 - Named patches on Services (other than the pinned fields), ConfigMaps,
   PrometheusRules, ServiceMonitors, PodDisruptionBudgets and ServiceAccounts have
   no content pin. A ServiceMonitor can make Prometheus present Secrets from its
@@ -164,5 +171,9 @@ cannot delete it and the verifier refuses until an administrator does, and runs 
 against the installed package, skipping lock gates of kinds the fixture never
 creates. With a stand-in for the Stage 1
 Roles, which are not in the repository, it also admits Jaeger history records in
-`default` and `jaeger` and a recovery ConfigMap in `opensearch`. A real Helm upgrade under these grants is a separate
-rehearsal.
+`default` and `jaeger` and a recovery ConfigMap in `opensearch`. For a release
+that lacks three rendered objects and carries two dropped ones, it admits
+Helm-style creates of the added Deployment, ConfigMap and ClusterRole and deletes
+of the dropped objects, and denies an added Deployment under another service
+account, a ConfigMap the commit does not add and a delete of a kept object. A real
+Helm upgrade under these grants is a separate rehearsal.

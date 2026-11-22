@@ -399,6 +399,84 @@ class ManualUpgradeTests(unittest.TestCase):
         served["spec"]["validations"].pop()
         self.assertFalse(verify.contains(policy["spec"], served["spec"]))
 
+    def changed(self):
+        """An upgrade that adds a Deployment, a ConfigMap, a hook-kind ClusterRole and a Secret, and drops two objects."""
+        rows = m.records()
+        steady = sorted(k for k, row in rows.items() if not row.get("hookEvents") and row["release"] != "supplement")
+        pick = {}
+        for key in steady:
+            for want in (("otel-demo", "apps", "deployments"), ("otel-demo", "", "configmaps"), ("cluster", m.RBAC_GROUP, "clusterroles"),
+                         ("default", "", "secrets")):
+                if key[:3] == want and want not in pick:
+                    pick[want] = key
+        added = sorted(pick.values())
+        removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired")]
+        changes = m.release_changes(set(steady) - set(added) | set(removed))
+        self.assertEqual(changes, {"added": added, "removed": sorted(removed)})
+        kinds = {(k[1], k[2]): HOOK_KINDS.get((k[1], k[2])) or m.PINNED.get((k[1], k[2])) for k in added}
+        kinds.update({("", "configmaps"): "ConfigMap", ("", "secrets"): "Secret"})
+        bodies = {k: fixture_object(*k[:3], k[3], kinds[k[1], k[2]]) for k in added}
+        return changes, bodies
+
+    def test_release_changes_refuse_deleting_unreviewed_kinds(self):
+        steady = {k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement"}
+        self.assertEqual(m.release_changes(steady), m.NO_CHANGES)
+        for stray in (("cluster", "apiextensions.k8s.io", "customresourcedefinitions", "x"), ("jaeger", "apps", "deployments", "x")):
+            with self.assertRaisesRegex(ValueError, "needs an operator"):
+                m.release_changes(steady | {stray})
+
+    def test_an_upgrade_that_changes_objects_grants_only_named_deletes_and_gated_creates(self):
+        changes, _ = self.changed()
+        guards, grants = m.package(USER, self.pinned, self.hooks, changes)
+        self.assertEqual(m.package(USER, self.pinned, self.hooks, m.NO_CHANGES), (self.guards, self.grants))
+        rules = list(rules_of(grants))
+        for scope, group, target, name in changes["added"]:
+            self.assertTrue(any(s == scope and rule["resources"] == [target] and "create" in rule["verbs"]
+                                and "resourceNames" not in rule for s, rule in rules), target)
+        for scope, group, target, name in changes["removed"]:
+            self.assertTrue(any(s == scope and rule["resources"] == [target] and rule["verbs"] == ["delete", "get"]
+                                and rule.get("resourceNames") == [name] for s, rule in rules), target)
+        self.assertFalse(any("delete" in rule["verbs"] and not rule.get("resourceNames") for s, rule in rules if rule["resources"] != ["secrets"]))
+        policies = {g["metadata"]["name"]: g["spec"] for g in guards if g["kind"] == "ValidatingAdmissionPolicy"}
+
+        def conditions(spec):
+            return " ".join(c["expression"] for c in spec["matchConditions"])
+        deployment = next(k for k in changes["added"] if k[2] == "deployments")
+        pin = next(spec for spec in policies.values() if spec["validations"][-1]["message"] == m.PIN_DENIED
+                   and '"' + deployment[3] + '"' in conditions(spec) and '"otel-demo"' in conditions(spec))
+        self.assertEqual(pin["matchConstraints"]["resourceRules"][0]["operations"], ["CREATE", "UPDATE"])
+        self.assertTrue(pin["validations"][-1]["expression"].startswith('request.operation == "CREATE" ? ('))
+        gates = [spec for spec in policies.values() if spec["validations"][-1]["message"] == m.CREATE_DENIED]
+        # Only the otel-demo ConfigMap and Deployment need a gate: the hook inventory and history cover the others.
+        self.assertEqual(sorted(g["matchConstraints"]["resourceRules"][0]["resources"][0] for g in gates), ["configmaps", "deployments"])
+        cluster_role = next(k for k in changes["added"] if k[2] == "clusterroles")
+        inventory = policies[m.PREFIX + "-hook-inventory-clusterroles"]["validations"][-1]["expression"]
+        self.assertIn('"' + cluster_role[3] + '"', inventory)
+        self.assertIn('"fixture-retired"', policies[m.PREFIX + "-hook-inventory-clusterrolebindings"]["validations"][-1]["expression"])
+        secret = next(k for k in changes["added"] if k[2] == "secrets")
+        self.assertIn('"default/' + secret[3] + '"', conditions(policies[m.PREFIX + "-history"]))
+        retire = [spec for name, spec in policies.items() if name.startswith(m.PREFIX + "-retire-")]
+        self.assertEqual(len(retire), 2)
+        self.assertTrue(all(spec["matchConstraints"]["resourceRules"][0]["operations"] == ["DELETE"] for spec in retire))
+        # Unchanged executor output: the exempt names never reach the executor's own hook controls.
+        self.assertEqual(hooks.controls(self.hooks), hooks.controls(self.hooks, exempt=None))
+
+    def test_readiness_probes_create_added_objects_and_lock_their_gates(self):
+        changes, bodies = self.changed()
+        probes = m.readiness_probes(self.pinned, self.hooks, changes, bodies)
+        deployment = next(k for k in changes["added"] if k[2] == "deployments")
+        on_create = [x for x in probes if x["label"].startswith("pin on create")]
+        self.assertTrue(any(x["body"]["metadata"]["name"] == deployment[3] and x["expect"] == m.PIN_DENIED
+                            and x["body"]["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 7919 for x in on_create))
+        self.assertFalse(any(x["verb"] == "patch" and x.get("name") == deployment[3] and x.get("namespace") == "otel-demo" for x in probes))
+        gates = sorted(x["label"] for x in probes if x["expect"] == m.CREATE_DENIED)
+        self.assertEqual(gates, ["create gate configmaps otel-demo", "create gate deployments otel-demo"])
+        self.assertTrue(all(x["body"]["metadata"]["name"] == m.PROBE for x in probes if x["expect"] == m.CREATE_DENIED))
+        retire = [x for x in probes if x["verb"] == "delete"]
+        self.assertEqual(sorted((x["namespace"] or "cluster", x["name"]) for x in retire),
+                         [("cluster", "fixture-retired"), ("otel-demo", "fixture-retired")])
+        self.assertTrue(all(x["phase"] == "unlocked" and x["expect"] == m.LOCK_DENIED for x in retire))
+
     def test_user_name_must_be_a_plain_user(self):
         for bad in ("", " padded", "system:serviceaccount:jaeger-demo-operations:jaeger-demo-executor", "a\nb", "x" * 257):
             with self.assertRaises(ValueError):

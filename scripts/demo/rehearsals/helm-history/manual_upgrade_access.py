@@ -85,7 +85,7 @@ def exercise(charts, kubectl, cfg, kube):
     kube(["create", "-f", "-"], body=json.dumps(checkpoint))
 
     with tempfile.TemporaryDirectory(prefix="manual-upgrade-") as scratch:
-        pinned, located = m.render_pinned(Path(charts), scratch)
+        pinned, located, rendered = m.render_pinned(Path(charts), scratch)
         install_operator_crds(located["oci-monitoring"], kube, scratch)
         defaulted = m.server_defaults(pinned, admin)
         definitions = hooks.pinned_hooks(located["oci-monitoring"])
@@ -95,11 +95,22 @@ def exercise(charts, kubectl, cfg, kube):
         leftover["metadata"].setdefault("labels", {})["helm.sh/chart"] = "kube-prometheus-stack-0.0.1"
         kube(["create", "-f", "-"], body=json.dumps(leftover))
         defaulted_hooks = m.dry_admitted_hooks(definitions, admin)
-    guards, grants = m.package(USER, defaulted, defaulted_hooks)
-    for item in guards + grants + stage1_fixture():
+    # The release as deployed lacks three objects this commit adds and carries two it drops.
+    steady = sorted(k for k, row in m.records().items() if not row.get("hookEvents") and row["release"] != "supplement")
+    probed = {"frontend", "prometheus-kube-prometheus-operator", "prometheus-kube-state-metrics"}
+    added = [next(k for k in steady if k[:3] == want and k[3] not in probed)
+             for want in (("otel-demo", "apps", "deployments"), ("otel-demo", "", "configmaps"), ("cluster", m.RBAC_GROUP, "clusterroles"))]
+    retired = [r.resource("v1", "ConfigMap", "fixture-retired", "otel-demo", data={"fixture": "true"}),
+               r.resource(m.RBAC_GROUP + "/v1", "ClusterRoleBinding", "fixture-retired",
+                          roleRef={"apiGroup": m.RBAC_GROUP, "kind": "ClusterRole", "name": "view"}, subjects=[])]
+    removed = [("otel-demo", "", "configmaps", "fixture-retired"), ("cluster", m.RBAC_GROUP, "clusterrolebindings", "fixture-retired")]
+    changes = m.release_changes(set(steady) - set(added) | set(removed))
+    guards, grants = m.package(USER, defaulted, defaulted_hooks, changes)
+    for item in guards + grants + stage1_fixture() + retired:
         kube(["create", "-f", "-"], body=json.dumps(item))
     for obj in defaulted:
-        kube(["create", "-f", "-"], body=json.dumps(live(obj)))
+        if m.ident(obj) not in added:
+            kube(["create", "-f", "-"], body=json.dumps(live(obj)))
     by_kind = {(o["kind"], o["metadata"]["name"]): o for o in defaulted}
 
     def user(args, body=None):
@@ -121,7 +132,7 @@ def exercise(charts, kubectl, cfg, kube):
 
     # The operator's readiness check, as documented: every guard installed, then content-specific
     # denials under a manual holder. Lock gates of kinds this fixture never creates are skipped below.
-    probes = m.readiness_probes(defaulted, definitions)
+    probes = m.readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]})
     verify.installed(guards, admin)
     # Helm's before-hook-creation delete of the older leftover is checked against this commit's hook,
     # so the retry would fail: the verifier refuses until an administrator removes it.
@@ -206,6 +217,26 @@ def exercise(charts, kubectl, cfg, kube):
         expect_allowed("reviewed hook " + definition["kind"], user(["create", "--field-manager=helm", "-f", "-", "--dry-run=server"],
                                                                    json.dumps(definition)))
 
+    # Helm creates what this commit adds, from the chart render, and deletes what it drops.
+    for key in added:
+        body = m.creatable(key, rendered[key])
+        expect_allowed(f"create of the added {key[2]} {key[3]}",
+                       eventually(lambda body=body: user(["create", "--field-manager=helm", "-f", "-", "--dry-run=server"], json.dumps(body)),
+                                  lambda result: not result.returncode))
+    for scope, group, target, name in removed:
+        expect_allowed(f"delete of the dropped {target} {name}",
+                       user((["-n", scope] if scope != "cluster" else []) + ["delete", m.resource_arg(group, target), name, "--dry-run=server"]))
+    tampered = m.creatable(added[0], rendered[added[0]])
+    tampered["spec"]["template"]["spec"]["serviceAccountName"] = "prometheus-kube-prometheus-operator"
+    expect_denied("added Deployment created under another service account",
+                  user(["create", "-f", "-", "--dry-run=server"], json.dumps(tampered)), PIN)
+    stray = m.creatable(added[1], rendered[added[1]], "fixture-unreviewed")
+    expect_denied("ConfigMap the commit does not add", user(["create", "-f", "-", "--dry-run=server"], json.dumps(stray)), m.CREATE_DENIED)
+    answer = kube([*as_user, "auth", "can-i", "delete", "configmaps/" + added[1][3], "-n", "otel-demo"], check=False)
+    if answer.stdout.strip() != "no":
+        raise ValueError("The manual user may delete a ConfigMap the commit keeps")
+    denied.append("RBAC: delete a kept ConfigMap")
+
     def record(namespace, release):
         return r.resource("v1", "Secret", f"sh.helm.release.v1.{release}.v99", namespace, type="helm.sh/release.v1",
                           data={"release": "Zml4dHVyZQ=="})
@@ -235,7 +266,8 @@ def exercise(charts, kubectl, cfg, kube):
         kube(args + ([r.HOLDER + "=" + value] if value else [r.HOLDER + "-"]))
         expect_denied(name, eventually(touch, lambda result: result.returncode), LOCK)
     present = {m.resource_arg(*m.KINDS[o["kind"]]) for o in defaulted}
-    readiness += verify.run([p for p in probes if p["phase"] == "held" or p["resource"] in present], "unlocked", admin, USER)
+    readiness += verify.run([p for p in probes if p["phase"] == "held" or p["verb"] != "patch" or p["resource"] in present],
+                            "unlocked", admin, USER)
     kube(["-n", "default", "delete", "configmap", r.CHECKPOINT])
     if not eventually(touch, lambda result: result.returncode).returncode:
         raise ValueError("A write was admitted without the checkpoint parameter")

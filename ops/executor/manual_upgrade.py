@@ -34,6 +34,8 @@ import tempfile
 import monitoring_hooks as hooks
 import permissions as r
 
+import yaml
+
 import access_matrix
 import scheduled_adapter as adapter
 import scheduled_inputs
@@ -77,6 +79,8 @@ OPERATOR_KINDS = {"Prometheus": ("monitoring.coreos.com", "prometheuses"), "Aler
 KINDS = {**{kind: gvr for gvr, kind in r.GVR.items() if kind in SURFACE}, **OPERATOR_KINDS, **WEBHOOKS}
 PINNED = {gvr: kind for kind, gvr in KINDS.items()}
 MAX_EXPRESSION = 48000
+# An upgrade that keeps every object needs no create or delete beyond hooks and history.
+NO_CHANGES = {"added": [], "removed": []}
 
 
 def subjects_for(user):
@@ -161,8 +165,9 @@ def webhook_checks(count, reference):
     return "(" + " && ".join(parts) + ")"
 
 
-def surface_expression(reviewed):
-    """CEL: the update keeps the current security surface, or takes exactly the reviewed one."""
+def surface_expression(reviewed, *, created=False):
+    """CEL: the update keeps the current security surface, or takes exactly the reviewed one. An object
+    this commit adds (`created`) must also be created with exactly the reviewed surface."""
     kind = reviewed["kind"]
     if kind in WEBHOOKS:
         count = len(reviewed.get("webhooks") or [])
@@ -175,12 +180,17 @@ def surface_expression(reviewed):
     if kind == "StatefulSet":
         storage = " && ".join(f"{value('object', p, d)} == {value('oldObject', p, d)}" for p, d in STATEFUL_STORAGE)
         expression = "(" + storage + ") && (" + expression + ")"
+    if created:
+        fresh = "(" + take + ")"
+        if kind == "StatefulSet":
+            fresh += " && " + " && ".join(f"{value('object', p, d)} == dyn({r.literal(at(reviewed, p, d))})" for p, d in STATEFUL_STORAGE)
+        expression = 'request.operation == "CREATE" ? (' + fresh + ") : (" + expression + ")"
     r.require(len(expression.encode()) <= MAX_EXPRESSION, f"{kind}/{reviewed['metadata']['name']} is too large for a native content policy")
     return expression
 
 
-def pins(defaulted, policies):
-    """One UPDATE policy per pinned object."""
+def pins(defaulted, policies, added=()):
+    """One UPDATE policy per pinned object, which also covers CREATE for an object this commit adds."""
     rows = records()
     expected = {key for key, row in rows.items() if (key[1], key[2]) in PINNED and not row.get("hookEvents")}
     seen = set()
@@ -192,8 +202,9 @@ def pins(defaulted, policies):
         scope, group, target, name = key
         condition = r.REQUEST_NS + " == " + json.dumps("" if scope == "cluster" else scope) + " && request.name == " + json.dumps(name)
         tag = PREFIX + "-pin-" + hashlib.sha256("/".join(key).encode()).hexdigest()[:16]
-        guards += policies(tag, group, target, ["UPDATE"], surface_expression(obj),
-                           PIN_DENIED, condition=condition)
+        created = key in added
+        guards += policies(tag, group, target, ["CREATE", "UPDATE"] if created else ["UPDATE"],
+                           surface_expression(obj, created=created), PIN_DENIED, condition=condition)
     missing = sorted(expected - seen)
     r.require(not missing, "Reviewed privileged objects missing from the render: " + ", ".join("/".join(k) for k in missing))
     return guards
@@ -219,17 +230,72 @@ def lock_gates(rows, policies):
     return guards
 
 
-def history(policies):
+def history(policies, changes=NO_CHANGES):
+    condition = r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")"
+    # A chart Secret this commit adds or drops is created or deleted under the create and retire gates instead.
+    changed = sorted(k[0] + "/" + k[3] for k in changes["added"] + changes["removed"] if k[1:3] == ("", "secrets"))
+    if changed:
+        condition += ' && !((request.namespace + "/" + request.name) in ' + json.dumps(changed) + ")"
     guards = policies(PREFIX + "-history", "", "secrets", ["CREATE", "UPDATE", "DELETE"], r.history_expression(HISTORY),
                       HISTORY_DENIED,
-                      condition=r.CHART_SECRET_UPDATE + json.dumps(r.MONITORING_SECRETS) + ")",
+                      condition=condition,
                       variables=[{"name": "records", "expression": r.HISTORY_RECORDS}])
     # The three chart-owned monitoring Secrets may change with the chart (documented residual risk);
     # the lock gate on their named patch still applies.
     return guards
 
 
-def grants(defaulted, subjects):
+def by_target(keys):
+    grouped = defaultdict(set)
+    for scope, group, target, name in keys:
+        grouped[scope, group, target].add(name)
+    return grouped
+
+
+def release_changes(deployed):
+    """Objects of the four releases' deployed manifests (hooks excluded) against this commit's reviewed render:
+    what the upgrade creates and what Helm deletes. Supplements are applied outside Helm and never counted."""
+    rows = records()
+    rendered = {k for k, row in rows.items() if not row.get("hookEvents") and row["release"] != "supplement"}
+    deployed = {tuple(k) for k in deployed}
+    kinds = {(k[1], k[2]) for k in rows}
+    removed = deployed - rendered
+    for key in sorted(removed):
+        r.require((key[1], key[2]) in kinds and key[0] in NAMESPACES + ("kube-system", "cluster"),
+                  "Removing this deployed object needs an operator: " + "/".join(key))
+    return {"added": sorted(rendered - deployed), "removed": sorted(removed)}
+
+
+def change_gates(changes, policies, hook_names):
+    """CREATE only for the names this commit adds (and the hooks of the same kind); DELETE of dropped objects
+    under the lock. Privileged added objects are also pinned on CREATE by pins()."""
+    guards = []
+    for (scope, group, target), names in sorted(create_targets(changes, hook_names).items()):
+        allowed = sorted(names)
+        where = r.REQUEST_NS + " == " + json.dumps("" if scope == "cluster" else scope)
+        tag = PREFIX + "-create-" + hashlib.sha256(f"{scope}/{group}/{target}".encode()).hexdigest()[:16]
+        guards += policies(tag, group, target, ["CREATE"], "request.name in " + json.dumps(allowed), CREATE_DENIED, condition=where)
+    for (scope, group, target), names in sorted(by_target(changes["removed"]).items()):
+        prefix = "" if scope == "cluster" else scope
+        condition = r.REQUEST_NS + ' + "/" + request.name in ' + json.dumps(sorted(prefix + "/" + n for n in names))
+        tag = PREFIX + "-retire-" + hashlib.sha256(f"{scope}/{group}/{target}".encode()).hexdigest()[:16]
+        guards += policies(tag, group, target, ["DELETE"], "true", LOCK_DENIED, condition=condition)
+    return guards
+
+
+def create_targets(changes, hook_names):
+    """Added objects that need their own create gate. Where the hook inventory or the history policy already
+    matches the same creates (they admit the added names as exempt), a second gate would make the denial
+    message ambiguous, since the API server reports one denying policy."""
+    gated = {}
+    for (scope, group, target), names in by_target(changes["added"]).items():
+        if (scope, group, target) in hook_names or ((group, target) == ("", "secrets") and scope in NAMESPACES):
+            continue
+        gated[scope, group, target] = names
+    return gated
+
+
+def grants(defaulted, subjects, changes=NO_CHANGES):
     rows = records()
     rules = defaultdict(list)
     for (scope, group, target), names in sorted(ordinary(rows).items()):
@@ -254,17 +320,37 @@ def grants(defaulted, subjects):
         rules[scope] += [r.rule(group, target, ["get", "list", "watch"]) for group, target in sorted(kinds)]
     for ns in NAMESPACES:
         rules[ns].append(r.rule("", "secrets", ["create", "delete", "update"]))
+    for (scope, group, target), names in sorted(by_target(changes["added"]).items()):
+        # RBAC cannot name a created object; the create gate and the pins limit it.
+        rules[scope].append(r.rule(group, target, ["create"]))
+        if target in ("roles", "clusterroles"):
+            # Escalation for a CREATE is checked against the collection, which has no resource name.
+            rules[scope].append(r.rule(group, target, ["escalate"], [""]))
+    for (scope, group, target), names in sorted(by_target(changes["removed"]).items()):
+        rules[scope].append(r.rule(group, target, ["delete", "get"], names))
     return [item for scope, scoped in sorted(rules.items()) for item in r.bindings(PREFIX + "-upgrade", scope, scoped, (), subjects=subjects)]
 
 
-def package(user, defaulted, defaulted_hooks):
-    """Return (guards, grants) for already server-defaulted pinned objects and hooks."""
+def package(user, defaulted, defaulted_hooks, changes=NO_CHANGES):
+    """Return (guards, grants) for already server-defaulted pinned objects and hooks, and the objects the
+    upgrade adds and removes (release_changes)."""
     subjects = subjects_for(user)
     policies = policy_builder(user)
-    guards = pins(defaulted, policies) + lock_gates(records(), policies) + history(policies)
+    hook_names = hook_targets(defaulted_hooks)
+    guards = (pins(defaulted, policies, set(map(tuple, changes["added"]))) + lock_gates(records(), policies)
+              + history(policies, changes) + change_gates(changes, policies, hook_names))
+    exempt = by_target(changes["added"] + changes["removed"])
     hook_guards, hook_grants = hooks.controls(defaulted_hooks, policies=policies, lock=None, archive_name=ARCHIVE,
-                                              prefix=PREFIX, subjects=subjects, account_guards=False, scoped=True)
-    return guards + hook_guards, grants(defaulted, subjects) + hook_grants
+                                              prefix=PREFIX, subjects=subjects, account_guards=False, scoped=True, exempt=exempt)
+    return guards + hook_guards, grants(defaulted, subjects, changes) + hook_grants
+
+
+def hook_targets(defaulted_hooks):
+    grouped = defaultdict(set)
+    for hook in defaulted_hooks:
+        group, target = hooks.KINDS[hook["kind"]]
+        grouped[hook["metadata"].get("namespace", "cluster"), group, target].add(hook["metadata"]["name"])
+    return grouped
 
 
 def review_copy(obj, namespace):
@@ -334,21 +420,43 @@ def verified_archives(located):
 
 
 def render_pinned(charts, scratch):
-    """Render the four releases and supplements. Returns ([(pinned object, namespace)], {release key: archive})."""
+    """Render the four releases and supplements. Returns ([(pinned object, namespace)], {release key: archive},
+    {identity: Helm-managed rendered object}); supplements are applied outside Helm and not in the last map."""
     kube_version = json.loads(r.MATRIX.read_bytes())["targetKubernetes"]
     env = {"PATH": os.environ["PATH"], "KUBECONFIG": os.devnull, "HOME": str(scratch)}
     located = verified_archives(access_matrix.packages(Path(charts), ROOT))
-    pinned = []
+    pinned, rendered = [], {}
     for key in RELEASE_KEYS:
         namespace = adapter.RELEASES[key][0]
         supplements = adapter.supplemental_for(key, ROOT) if key in COMPONENTS else []
-        for obj in access_matrix.render(key, located[key], ROOT, kube_version, env) + supplements:
+        charted = access_matrix.render(key, located[key], ROOT, kube_version, env)
+        for obj in charted + supplements:
             if obj["kind"] in KINDS and not access_matrix.hook_events(obj):
                 pinned.append((obj, namespace))
-    return pinned, located
+        for obj in charted:
+            if not access_matrix.hook_events(obj):
+                rendered[identity(key, obj, namespace)] = obj
+    return pinned, located, rendered
+
+
+def identity(key, obj, namespace):
+    return tuple(access_matrix.row_key(key, adapter.identity(obj, namespace), False)[2:])
+
+
+def deployed_objects(kubeconfig, context, scratch):
+    """Identities in each release's deployed manifest. `helm get manifest` leaves out hooks."""
+    env = {"PATH": os.environ["PATH"], "HOME": str(scratch)}
+    found = set()
+    for key in RELEASE_KEYS:
+        namespace, release = adapter.RELEASES[key][:2]
+        manifest = subprocess.run(["helm", "get", "manifest", release, "--namespace", namespace, "--kubeconfig", kubeconfig,
+                                   "--kube-context", context], env=env, capture_output=True, timeout=120, check=True).stdout
+        found |= {identity(key, obj, namespace) for obj in yaml.safe_load_all(manifest) if obj}
+    return found
 
 
 PIN_DENIED = "Privileged fields differ from the reviewed render of this commit"
+CREATE_DENIED = "Only objects this commit adds may be created"
 LOCK_DENIED = "A manual deployment lock holder is required"
 HOOK_DENIED = "Hook differs from the independently reviewed monitoring baseline"
 INVENTORY_DENIED = "Only the twelve reviewed monitoring hooks may be created or deleted"
@@ -379,15 +487,44 @@ def pin_probe(obj):
     return "json", [{"op": "replace", "path": "/webhooks/0/timeoutSeconds", "value": timeout % 30 + 1}]
 
 
-def readiness_probes(defaulted, definitions):
-    """probes.json for manual_upgrade_verify.py: one content probe per pin, hook, inventory target and
-    history namespace under a manual holder, and one lock probe per lock gate without one."""
+def merged(target, change):
+    if not isinstance(change, dict) or not isinstance(target, dict):
+        return copy.deepcopy(change)
+    return {**target, **{k: merged(target.get(k), v) for k, v in change.items()}}
+
+
+def creatable(key, body, name=None):
+    """A rendered object as Helm would send it, in its namespace, optionally renamed."""
+    obj = copy.deepcopy(body)
+    if key[0] != "cluster":
+        obj["metadata"]["namespace"] = key[0]
+    if name:
+        obj["metadata"] = {k: v for k, v in obj["metadata"].items() if k in ("namespace", "labels", "annotations")}
+        obj["metadata"]["name"] = name
+    return obj
+
+
+def readiness_probes(defaulted, definitions, changes=NO_CHANGES, bodies=None):
+    """probes.json for manual_upgrade_verify.py: one content probe per pin, hook, inventory target, create gate
+    and history namespace under a manual holder, and one lock probe per lock, create and retire gate without one.
+    An object this commit adds is probed with a create, since it does not exist yet."""
+    added = {tuple(k) for k in changes["added"]}
+    bodies = bodies or {}
     probes = []
     for obj in defaulted:
         scope, group, target, name = ident(obj)
         if obj["kind"] in WEBHOOKS and not obj.get("webhooks"):
             continue
         kind_of_patch, change = pin_probe(obj)
+        if (scope, group, target, name) in added:
+            body = creatable((scope, group, target, name), bodies[scope, group, target, name])
+            if kind_of_patch == "merge":
+                body = merged(body, change)
+            else:
+                body["webhooks"][0]["timeoutSeconds"] = change[0]["value"]
+            probes.append({"phase": "held", "label": f"pin on create {obj['kind']} {scope}/{name}", "verb": "create",
+                           "namespace": None, "body": body, "expect": PIN_DENIED})
+            continue
         probes.append({"phase": "held", "label": f"pin {obj['kind']} {scope}/{name}", "verb": "patch", "resource": resource_arg(group, target),
                        "namespace": None if scope == "cluster" else scope, "name": name, "type": kind_of_patch,
                        "patch": change, "expect": PIN_DENIED})
@@ -409,9 +546,22 @@ def readiness_probes(defaulted, definitions):
         probes.append({"phase": "held", "label": f"history {namespace}", "verb": "create", "namespace": None,
                        "body": secret, "expect": HISTORY_DENIED})
     for (scope, group, target), names in sorted(ordinary(records()).items()):
+        existing = sorted(n for n in names if (scope, group, target, n) not in added)
+        if not existing:
+            continue
         probes.append({"phase": "unlocked", "label": f"lock {target} {scope}", "verb": "patch", "resource": resource_arg(group, target),
-                       "namespace": None if scope == "cluster" else scope, "name": sorted(names)[0], "type": "merge",
+                       "namespace": None if scope == "cluster" else scope, "name": existing[0], "type": "merge",
                        "patch": {"metadata": {"labels": {PROBE_LABEL: "true"}}}, "expect": LOCK_DENIED})
+    for (scope, group, target), names in sorted(create_targets(changes, hook_targets(definitions)).items()):
+        first = (scope, group, target, sorted(names)[0])
+        probes.append({"phase": "held", "label": f"create gate {target} {scope}", "verb": "create", "namespace": None,
+                       "body": creatable(first, bodies[first], PROBE), "expect": CREATE_DENIED})
+        probes.append({"phase": "unlocked", "label": f"lock on create {target} {scope}", "verb": "create", "namespace": None,
+                       "body": creatable(first, bodies[first]), "expect": LOCK_DENIED})
+    for (scope, group, target), names in sorted(by_target(changes["removed"]).items()):
+        probes.append({"phase": "unlocked", "label": f"lock on retire {target} {scope}", "verb": "delete",
+                       "resource": resource_arg(group, target), "namespace": None if scope == "cluster" else scope,
+                       "name": sorted(names)[0], "expect": LOCK_DENIED})
     return probes
 
 
@@ -446,17 +596,19 @@ def main():
             staging.mkdir()
             scheduled_inputs.charts_for(ROOT, staging, scheduled_inputs.public_env(staging))
             charts = staging / "charts"
-        pinned, located = render_pinned(charts, scratch)
+        pinned, located, rendered = render_pinned(charts, scratch)
+        changes = release_changes(deployed_objects(args.kubeconfig, args.context, scratch))
         defaulted = server_defaults(pinned, kube)
         definitions = hooks.pinned_hooks(located["oci-monitoring"])
         defaulted_hooks = dry_admitted_hooks(definitions, kube)
-        guards, granted = package(args.user, defaulted, defaulted_hooks)
-        probes = readiness_probes(defaulted, definitions)
+        guards, granted = package(args.user, defaulted, defaulted_hooks, changes)
+        probes = readiness_probes(defaulted, definitions, changes, {k: rendered[k] for k in changes["added"]})
         archives = {key: hashlib.sha256(located[key].read_bytes()).hexdigest() for key in RELEASE_KEYS}
     args.output.mkdir(mode=0o700)
     summary = {"configurationSHA": commit, "clusterUID": args.cluster_uid, "kubernetes": kube_version,
                "chartArchiveSHA256": archives, "pinnedObjects": len(defaulted), "hooks": len(defaulted_hooks),
                "guards": len(guards), "grants": len(granted), "probes": len(probes),
+               "added": ["/".join(k) for k in changes["added"]], "removed": ["/".join(k) for k in changes["removed"]],
                "order": "Apply guards.json, then grants.json. Remove grants.json before guards.json."}
     for name, items in (("guards", guards), ("grants", granted)):
         (args.output / (name + ".json")).write_bytes(adapter.encode({"apiVersion": "v1", "kind": "List", "items": items}))

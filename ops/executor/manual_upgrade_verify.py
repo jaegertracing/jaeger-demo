@@ -85,10 +85,12 @@ def holder(kube):
 def attempt(probe, kube, user):
     base = [*kube, "--as", user, "--as-group", "system:authenticated"]
     namespace = ["-n", probe["namespace"]] if probe.get("namespace") else []
+    body = None
     if probe["verb"] == "patch":
         args = [*base, *namespace, "patch", probe["resource"], probe["name"], "--type=" + probe["type"],
                 "-p", json.dumps(probe["patch"]), "--dry-run=server"]
-        body = None
+    elif probe["verb"] == "delete":
+        args = [*base, *namespace, "delete", probe["resource"], probe["name"], "--dry-run=server"]
     else:
         args = [*base, *namespace, "create", "-f", "-", "--dry-run=server"]
         body = json.dumps(probe["body"])

@@ -609,13 +609,20 @@ def identity(key, obj, namespace):
 
 
 def deployed_objects(kubeconfig, context, scratch):
-    """Each release's deployed manifest by identity, with the release key. `helm get manifest` leaves out hooks."""
+    """Each release's last successful manifest by identity, with the release key. After a failed upgrade Helm
+    takes the original for its patch and its deletions from the last deployed or superseded revision, not the
+    failed one (as scheduled_adapter.history does). `helm get manifest` leaves out hooks."""
     env = {"PATH": os.environ["PATH"], "HOME": str(scratch)}
     found = {}
     for key in RELEASE_KEYS:
         namespace, release = adapter.RELEASES[key][:2]
-        manifest = subprocess.run(["helm", "get", "manifest", release, "--namespace", namespace, "--kubeconfig", kubeconfig,
-                                   "--kube-context", context], env=env, capture_output=True, timeout=120, check=True).stdout
+        where = ["--namespace", namespace, "--kubeconfig", kubeconfig, "--kube-context", context]
+        rows = json.loads(subprocess.run(["helm", "history", release, *where, "--max", "256", "-o", "json"], env=env,
+                                         capture_output=True, timeout=120, check=True).stdout)
+        successful = [row["revision"] for row in rows if row["status"] in ("deployed", "superseded")]
+        r.require(successful, "No successful revision of " + release + "; recover it before rendering")
+        manifest = subprocess.run(["helm", "get", "manifest", release, *where, "--revision", str(max(successful))],
+                                  env=env, capture_output=True, timeout=120, check=True).stdout
         found.update({identity(key, obj, namespace): (key, obj) for obj in yaml.safe_load_all(manifest) if obj})
     return found
 

@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ops/executor"))
@@ -645,6 +647,25 @@ class ManualUpgradeTests(unittest.TestCase):
         self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Update"}]}}))
         self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "other", "operation": "Apply"}]}}))
         self.assertIsNone(m.apply_manager({"metadata": {"managedFields": [{"manager": "helm", "operation": "Apply", "subresource": "status"}]}}))
+
+    def test_a_retry_after_a_failed_upgrade_uses_the_last_successful_manifest(self):
+        history = [{"revision": 3, "status": "superseded"}, {"revision": 4, "status": "deployed"}, {"revision": 5, "status": "failed"}]
+        manifest = yaml.safe_dump({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "kept", "namespace": "otel-demo"}})
+        calls = []
+
+        def fake(argv, **_):
+            calls.append(argv)
+            body = json.dumps(history) if "history" in argv else manifest
+            return subprocess.CompletedProcess(argv, 0, body.encode(), b"")
+        with mock.patch.object(m, "RELEASE_KEYS", ("otel-demo",)), mock.patch.object(m.subprocess, "run", side_effect=fake):
+            found = m.deployed_objects("config", "fixture", "/tmp")
+        self.assertEqual(list(found), [("otel-demo", "", "configmaps", "kept")])
+        get, = [c for c in calls if "manifest" in c]
+        self.assertEqual(get[get.index("--revision") + 1], "4")
+        history[:] = [{"revision": 1, "status": "failed"}]
+        with mock.patch.object(m, "RELEASE_KEYS", ("otel-demo",)), mock.patch.object(m.subprocess, "run", side_effect=fake), \
+                self.assertRaisesRegex(ValueError, "No successful revision"):
+            m.deployed_objects("config", "fixture", "/tmp")
 
     def test_release_methods_come_from_the_latest_helm_record(self):
         def record(version, method):

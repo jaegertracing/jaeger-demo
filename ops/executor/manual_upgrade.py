@@ -27,12 +27,12 @@ from collections import defaultdict
 import copy
 import hashlib
 import json
-import gzip
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import zlib
 
 import monitoring_hooks as hooks
 import permissions as r
@@ -482,7 +482,11 @@ def release_methods(kube):
         latest = max(found, key=lambda item: int(item["metadata"]["labels"]["version"]))
         raw = base64.b64decode(base64.b64decode(latest["data"]["release"], validate=True), validate=True)
         if raw.startswith(b"\x1f\x8b"):
-            raw = gzip.decompress(raw)
+            # The manual user can write canonical history records; bound the decompression as helm_record does.
+            decoder = zlib.decompressobj(31)
+            raw = decoder.decompress(raw, adapter.LIMIT + 1)
+            r.require(decoder.eof and not decoder.unused_data, "Invalid compressed Helm record")
+        r.require(len(raw) <= adapter.LIMIT, "Oversized Helm record")
         method = json.loads(raw).get("apply_method", "") or "csa"
         r.require(method in ("csa", "ssa"), "Unknown Helm release apply method")
         methods[key] = method

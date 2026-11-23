@@ -132,6 +132,32 @@ curl -s -o /dev/null -w '%{redirect_url}\n' 'https://opensearch.demo.jaegertraci
 curl -s -o /dev/null -w '%{http_code}\n' 'https://shop.demo.jaegertracing.io/loadgen/'
 curl -s -o /dev/null -w '%{http_code}\n' 'https://shop.demo.jaegertracing.io/feature'
 ```
+- The agent answers every prompt the load generator sends. A ready agent is not
+  enough: a prompt with no recorded match fails with the agent running. After
+  an OTel demo rollout, the Deployment must report ready:
+```bash path=null start=null
+kubectl -n otel-demo rollout status deployment/agent --timeout=120s
+```
+  Then wait ten minutes for fresh traffic and run this read-only query. It must
+  print three lines, one for each prompt, and each line must show at least one
+  answered request and `0 failed`. A missing line or any failure means the
+  change is not verified. The `user_ask_agent` span carries no error when a
+  prompt fails; the error is on its child `POST` span, which is what the query
+  reads.
+```bash path=null start=null
+curl -sG 'https://jaeger.demo.jaegertracing.io/api/v3/traces' \
+  --data-urlencode 'query.service_name=load-generator' \
+  --data-urlencode 'query.operation_name=user_ask_agent' \
+  --data-urlencode "query.start_time_min=$(jq -rn 'now - 600 | todate')" \
+  --data-urlencode "query.start_time_max=$(jq -rn 'now | todate')" \
+  --data-urlencode 'query.search_depth=100' |
+  jq -r '[.result.resourceSpans[].scopeSpans[].spans[]] | group_by(.traceId) | map({
+      prompt: (map(select(.name == "user_ask_agent") | .attributes[]
+        | select(.key == "gen_ai.input.messages") | .value.stringValue | fromjson[0].parts[0].content) | first),
+      failed: any(.[]; .name == "POST" and .status.code == 2)
+    }) | group_by(.prompt)[]
+    | "\(map(select(.failed | not)) | length) answered, \(map(select(.failed)) | length) failed: \(.[0].prompt)"'
+```
 
 
 ## Automatic port-forward using scrpit

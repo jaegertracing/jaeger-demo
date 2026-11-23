@@ -119,7 +119,8 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   API key, and its model endpoint is the unresolvable `https://llm.invalid`; the
   MCP server and the public chat UI stay off. The release gains a Deployment, a
   Service and the 828 KB `agent-fixtures` ConfigMap, which the deployer role
-  already covers.
+  already covers. The OTel stack README adds the post-rollout check that every
+  load generator prompt is answered.
   ([#115](https://github.com/jaegertracing/jaeger-demo/pull/115),
   refs [#55](https://github.com/jaegertracing/jaeger-demo/issues/55))
 

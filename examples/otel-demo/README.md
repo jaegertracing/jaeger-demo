@@ -140,10 +140,14 @@ kubectl -n otel-demo rollout status deployment/agent --timeout=120s
 ```
   Then wait ten minutes for fresh traffic and run this read-only query. It must
   print three lines, one for each prompt, and each line must show at least one
-  answered request and `0 failed`. A missing line or any failure means the
-  change is not verified. The `user_ask_agent` span carries no error when a
-  prompt fails; the error is on its child `POST` span, which is what the query
-  reads.
+  answered request, `0 failed` and `0 incomplete`. A missing line, an extra
+  line, a failure, an incomplete trace or a non-zero exit means the change is
+  not verified. The `user_ask_agent` span carries no error when a prompt fails,
+  so the query reads the load generator's request to the agent in the same
+  trace: answered needs that request to have returned 200 without an error
+  status, and a trace without that request is incomplete, not answered. The
+  search returns a stream of results, which the query reads whole and rejects
+  on a stream error.
 ```bash path=null start=null
 curl -sG 'https://jaeger.demo.jaegertracing.io/api/v3/traces' \
   --data-urlencode 'query.service_name=load-generator' \
@@ -151,12 +155,17 @@ curl -sG 'https://jaeger.demo.jaegertracing.io/api/v3/traces' \
   --data-urlencode "query.start_time_min=$(jq -rn 'now - 600 | todate')" \
   --data-urlencode "query.start_time_max=$(jq -rn 'now | todate')" \
   --data-urlencode 'query.search_depth=100' |
-  jq -r '[.result.resourceSpans[].scopeSpans[].spans[]] | group_by(.traceId) | map({
+  jq -rs 'if any(.[]; has("error")) then error("Jaeger search returned a stream error") else . end
+    | [.[].result.resourceSpans[]?.scopeSpans[]?.spans[]?] | group_by(.traceId) | map({
       prompt: (map(select(.name == "user_ask_agent") | .attributes[]
         | select(.key == "gen_ai.input.messages") | .value.stringValue | fromjson[0].parts[0].content) | first),
-      failed: any(.[]; .name == "POST" and .status.code == 2)
+      state: (map(select(any(.attributes[]?; .key == "http.url" and (.value.stringValue | endswith(":8010/prompt")))))
+        | if length == 0 then "incomplete"
+          elif all(.[]; .status.code != 2
+            and any(.attributes[]; .key == "http.status_code" and (.value.intValue | tostring) == "200"))
+          then "answered" else "failed" end)
     }) | group_by(.prompt)[]
-    | "\(map(select(.failed | not)) | length) answered, \(map(select(.failed)) | length) failed: \(.[0].prompt)"'
+    | "\(map(select(.state == "answered")) | length) answered, \(map(select(.state == "failed")) | length) failed, \(map(select(.state == "incomplete")) | length) incomplete: \(.[0].prompt)"'
 ```
 
 

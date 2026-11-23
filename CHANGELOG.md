@@ -120,7 +120,8 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   MCP server and the public chat UI stay off. The release gains a Deployment, a
   Service and the 828 KB `agent-fixtures` ConfigMap, which the deployer role
   already covers.
-  (refs [#55](https://github.com/jaegertracing/jaeger-demo/issues/55))
+  ([#115](https://github.com/jaegertracing/jaeger-demo/pull/115),
+  refs [#55](https://github.com/jaegertracing/jaeger-demo/issues/55))
 
 ### Fixed
 

@@ -113,6 +113,14 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
   listing omits, stops the run before any write.
   ([#109](https://github.com/jaegertracing/jaeger-demo/pull/109),
   fixes [#106](https://github.com/jaegertracing/jaeger-demo/issues/106))
+- The OpenTelemetry Demo values enable the `agent` service, so the load
+  generator's assistant requests have a service to answer them instead of failing
+  as error spans. The agent answers from the chart's recorded responses, holds no
+  API key, and its model endpoint is the unresolvable `https://llm.invalid`; the
+  MCP server and the public chat UI stay off. The release gains a Deployment, a
+  Service and the 828 KB `agent-fixtures` ConfigMap, which the deployer role
+  already covers.
+  (refs [#55](https://github.com/jaegertracing/jaeger-demo/issues/55))
 
 ### Fixed
 

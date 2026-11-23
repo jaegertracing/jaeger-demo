@@ -809,6 +809,45 @@
       "source": "pinned Helm upgrade render"
     },
     {
+      "component": "otel-demo",
+      "release": "otel-demo",
+      "scope": "otel-demo",
+      "apiGroup": "",
+      "resource": "configmaps",
+      "name": "agent-fixtures",
+      "verbs": [
+        "get",
+        "patch"
+      ],
+      "source": "pinned Helm upgrade render"
+    },
+    {
+      "component": "otel-demo",
+      "release": "otel-demo",
+      "scope": "otel-demo",
+      "apiGroup": "",
+      "resource": "services",
+      "name": "agent",
+      "verbs": [
+        "get",
+        "patch"
+      ],
+      "source": "pinned Helm upgrade render"
+    },
+    {
+      "component": "otel-demo",
+      "release": "otel-demo",
+      "scope": "otel-demo",
+      "apiGroup": "apps",
+      "resource": "deployments",
+      "name": "agent",
+      "verbs": [
+        "get",
+        "patch"
+      ],
+      "source": "pinned Helm upgrade render"
+    },
+    {
       "component": "oci-monitoring",
       "release": "prometheus",
       "scope": "default",

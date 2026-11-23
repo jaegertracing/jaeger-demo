@@ -574,6 +574,8 @@ testPinnedChartRendersReviewedApplicationShape() {
   local count
   local pipeline
   local attribute
+  local setting
+  local value
 
   chart_version=$(bash -c \
     'source "$1"; printf "%s" "$OTEL_DEMO_CHART_VERSION"' \
@@ -589,10 +591,23 @@ testPinnedChartRendersReviewedApplicationShape() {
   assertEquals "pinned OTel Demo chart should render" 0 "$render_rc"
   [[ "$render_rc" -eq 0 ]] || return
 
-  # The agent's recorded responses render an 828 KB ConfigMap, which the assistant stack leaves out.
-  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-(agent|mcp|chatbot)'?\$" || true)
-  assertEquals "the assistant stack should stay disabled" 0 "$count"
-  assertNotContains "$rendered" "name: agent-fixtures"
+  # The load generator asks the agent, which answers from the chart's recorded
+  # responses. The MCP server and the public chat UI stay off.
+  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-agent'?\$" || true)
+  assertEquals "the agent should be deployed" 1 "$count"
+  assertContains "$rendered" "name: agent-fixtures"
+  count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-(mcp|chatbot)'?\$" || true)
+  assertEquals "the MCP server and the chat UI should stay disabled" 0 "$count"
+  # A prompt with no recorded match is sent to LLM_BASE_URL, and the chart's
+  # placeholder host resolves. No rendered service may name a reachable model
+  # endpoint or carry a key.
+  for setting in 'LLM_BASE_URL=value: https://llm.invalid' 'USE_VCR=value: "True"' 'API_KEY=value: ""'; do
+    count=$(printf '%s\n' "$rendered" | grep -c -- "- name: ${setting%%=*}\$" || true)
+    assertEquals "only the agent should set ${setting%%=*}" 1 "$count"
+    value=$(printf '%s\n' "$rendered" | grep -A1 -- "- name: ${setting%%=*}\$" | tail -1 | sed 's/^ *//')
+    assertEquals "the agent's ${setting%%=*}" "${setting#*=}" "$value"
+  done
+  assertNotContains "$rendered" "local-llm.com"
   # The shop's public proxy would expose the OpAMP server's unauthenticated interface.
   count=$(printf '%s\n' "$rendered" | grep -c -E "image: .*/demo:[0-9.]+-opamp-server'?\$" || true)
   assertEquals "the OpAMP server should stay disabled" 0 "$count"
@@ -617,12 +632,14 @@ testPinnedChartRendersReviewedApplicationShape() {
   # Jaeger is public. The chart's emitRawPii flag puts the customer's email, card
   # number and CVV on checkout and payment spans, and the collector override
   # replaces the chart pipeline that would remove them.
-  pipeline=$(printf '%s\n' "$rendered" | awk '
+  # awk stops reading early. A here-string does not report a broken pipe for the
+  # rest of the render the way a pipe from printf does.
+  pipeline=$(awk '
     /^ +pipelines:$/ { inside = 1; next }
     inside && /^ +processors:$/ { list = 1; next }
     list && /^ +- / { sub(/^ +- /, ""); printf "%s ", $0; next }
     list { exit }
-  ')
+  ' <<<"$rendered")
   assertEquals "the trace pipeline should drop raw personal data before batching" \
     "memory_limiter k8s_attributes resource transform/drop_raw_pii batch " "$pipeline"
   for attribute in user.email demo.payment.card_number demo.payment.card_cvv; do

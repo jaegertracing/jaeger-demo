@@ -152,13 +152,20 @@ components:
         image: docker.io/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
         command: ["sh", "-c", "until nc -z -v -w30 flagd 8013; do echo waiting for flagd; sleep 2; done;"]
 
-  # The assistant stack stays off. Enabling the agent makes the chart render an
-  # 828 KB ConfigMap of recorded LLM responses, which exceeded the 640 KiB
-  # approval partitions of the retired executor. The load generator still asks the
-  # agent on about one request in eleven; those requests fail and appear as
-  # error spans from the load-generator service.
+  # The agent runs because the load generator asks it on about one request in
+  # eleven, and those requests failed as error spans while it was off. It answers
+  # from the chart's recorded responses (USE_VCR, the 828 KB agent-fixtures
+  # ConfigMap) and holds no API key. Its replay sends a prompt with no recorded
+  # match to LLM_BASE_URL, and the chart's placeholder there is a host that
+  # resolves. The reserved .invalid name never resolves, so such a prompt fails
+  # here. Changing this value to a real provider activates a live model, which
+  # is a separate decision. The MCP server and the public chat UI stay off, so
+  # only the load generator reaches the agent.
   agent:
-    enabled: false
+    enabled: true
+    envOverrides:
+      - name: LLM_BASE_URL
+        value: https://llm.invalid
   mcp:
     enabled: false
 

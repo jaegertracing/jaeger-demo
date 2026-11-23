@@ -87,6 +87,13 @@ ROLLOUT_TIMEOUT=900 ./deploy-all.sh upgrade
     The load generator runs headless and the flagd-ui sidecar is removed: the
     public `/loadgen/` and `/feature` routes have no backend, and the feature
     flags stay at their reviewed `demo.flagd.json` content.
+    The shopping assistant's `agent` service runs for the load generator only.
+    It answers from the chart's recorded responses, holds no API key, and its
+    model endpoint is the unresolvable `https://llm.invalid`, so a prompt with
+    no recorded match fails instead of leaving the cluster. The assistant's MCP
+    server and public chat UI are not deployed. Pointing `LLM_BASE_URL` in
+    `otel-demo-values.yaml` at a real provider activates a live model and needs
+    its own decision.
 
 
 ## Verifying the deployment

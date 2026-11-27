@@ -196,6 +196,14 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
 
 ### Changed
 
+- The **Rendered resource changes** job now renders the head from the chart archives
+  that `scripts/demo/chart_archives.py state` verified against the lock, and fails
+  when they do not verify. A base with a Helmfile is verified the same way, and
+  only a script-era base keeps the publisher render; the summary says which side
+  was verified.
+  ([#154](https://github.com/jaegertracing/jaeger-demo/pull/154),
+  fixes [#144](https://github.com/jaegertracing/jaeger-demo/issues/144))
+
 - The owner decided to keep the community ingress-nginx controller in place, with no
   replacement planned in this migration. This is an accepted risk for a public demo
   whose data is disposable and which holds no credentials behind its routes. The

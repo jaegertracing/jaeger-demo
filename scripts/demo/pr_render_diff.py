@@ -5,6 +5,7 @@
 """Compare offline PR base and head renders. Print only validated Kubernetes identities."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import tempfile
 
 import yaml
 
+from chart_archives import LOCKED_STATE
 from companion_values import source_values
 
 # The parity rehearsal owns the script-era chart arguments and fixture images.
@@ -51,7 +53,7 @@ def index_objects(records, ns, release, docs):
         records[key] = hashlib.sha256(canonical).digest()
 
 
-def summary(base, head, before, after, legacy):
+def summary(base, head, before, after, legacy, base_verified=False):
     for commit in (before, after):
         if not re.fullmatch(r"[a-f0-9]{40}", commit):
             raise ValueError("Invalid revision identity")
@@ -64,6 +66,8 @@ def summary(base, head, before, after, legacy):
         counts[state] += 1
         changed.append((state, key))
     output = ["## Rendered Kubernetes changes", "", f"Base `{before}` and head `{after}`.", ""]
+    output += ["Head charts: verified against the chart archive lock. "
+               f"Base charts: {'verified against the lock' if base_verified else 'NOT verified, rendered from the chart publishers'}.", ""]
     if legacy:
         output += ["The base uses the script-era chart arguments and supplemental manifests. The head uses Helmfile.", ""]
     output += [f"{counts['Added']} added, {counts['Modified']} modified, {counts['Removed']} removed. "
@@ -95,6 +99,50 @@ def revision(root):
                                    text=True, stderr=subprocess.DEVNULL).strip()
 
 
+def tool_env(temp, home):
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "KUBECONFIG": os.devnull,
+           "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+           "HELM_CACHE_HOME": str(temp / "cache"), "HELM_CONFIG_HOME": str(temp / "config"),
+           "HELM_DATA_HOME": str(temp / "data")}
+    if "HELM_PLUGINS" in os.environ:
+        env["HELM_PLUGINS"] = os.environ["HELM_PLUGINS"]
+    return env
+
+
+class VerificationError(ValueError):
+    """A chart archive did not verify against its lock."""
+
+
+@contextlib.contextmanager
+def locked_state(root, temp):
+    """Write root's lock-verified Helmfile state and yield its path relative to root.
+
+    Any refusal, including a digest mismatch or a failed pull, is an error. Nothing falls back
+    to the publishers' charts. On exit the checkout's previous state file is restored, or the
+    written state removed when there was none, so a local comparison never leaves a state whose
+    archive paths point into a deleted temporary directory.
+    """
+    home = temp / "home"
+    home.mkdir(mode=0o700, parents=True)
+    child_env = tool_env(temp, home)
+    archives = temp / "archives"
+    archives.mkdir(mode=0o700)
+    target = root / LOCKED_STATE
+    previous = target.read_bytes() if target.is_file() else None
+    try:
+        try:
+            child(root, child_env, sys.executable, "scripts/demo/chart_archives.py", "state", str(archives))
+        except ValueError as error:
+            raise VerificationError("Chart archives did not verify") from error
+        yield LOCKED_STATE
+    finally:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.write_bytes(previous)
+
+
 def render(root, temp, legacy, target=TARGET, index=index_objects, images=IMAGES, stable=True, state="helmfile.yaml"):
     """Render the six releases. `target`, `index`, `images`, `stable` and `state` let another check reuse this render.
 
@@ -110,13 +158,7 @@ def render(root, temp, legacy, target=TARGET, index=index_objects, images=IMAGES
     temp.mkdir(mode=0o700)
     home = temp / "home"
     home.mkdir(mode=0o700)
-    env = {"PATH": os.environ["PATH"], "HOME": str(home), "KUBECONFIG": os.devnull,
-           "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
-           "HELM_CACHE_HOME": str(temp / "cache"), "HELM_CONFIG_HOME": str(temp / "config"),
-           "HELM_DATA_HOME": str(temp / "data")}
-    if "HELM_PLUGINS" in os.environ:
-        env["HELM_PLUGINS"] = os.environ["HELM_PLUGINS"]
+    env = tool_env(temp, home)
     tools = root / ".tools"
     tools.mkdir(exist_ok=True)
     child(root, env, "bash", "-eu", "-o", "pipefail", "-c",
@@ -175,11 +217,19 @@ def main():
         legacy = not (base / "helmfile.yaml").is_file()
         with tempfile.TemporaryDirectory(prefix="demo-pr-renders-") as staging:
             root = Path(staging)
-            baseline = render(base, root / "base", legacy)
-            candidate = render(head, root / "head", False)
+            # The head must verify. Every Helmfile base can verify too, so only a script-era
+            # base keeps the publisher render; a Helmfile base that does not verify fails the job.
+            with contextlib.ExitStack() as states:
+                head_state = states.enter_context(locked_state(head, root / "head-archives"))
+                base_verified = not legacy
+                base_state = states.enter_context(locked_state(base, root / "base-archives")) if base_verified else "helmfile.yaml"
+                baseline = render(base, root / "base", legacy, state=base_state)
+                candidate = render(head, root / "head", False, state=head_state)
             if (before, after) != (revision(base), revision(head)):
                 raise ValueError("Checkout changed while rendering")
-            print(summary(baseline, candidate, before, after, legacy), end="")
+            print(summary(baseline, candidate, before, after, legacy, base_verified), end="")
+    except VerificationError:
+        parser.exit(1, "Could not verify the pinned chart archives against the lock.\n")
     except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError, yaml.YAMLError):
         # Child tools, YAML parser excerpts and exception values can include an
         # entire Secret. The public job gets only this fixed failure message.

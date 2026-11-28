@@ -730,7 +730,7 @@ class DriverTest(unittest.TestCase):
 
         self.assertEqual(set(), FORBIDDEN_KEYS & set(keys(record)))
         text = (self.root / hd.RECORD).read_text()
-        generator = (ROOT / "examples/oci/load-generator/generate_traces.py").read_text()
+        generator = (ROOT / "examples/trace-generator/generate_traces.py").read_text()
         self.assertNotIn(generator[:200], text)
         self.assertEqual((HEAD, CORE, "digest", "succeeded"),
                          (record["configCommit"], record["coreMain"], record["imageMode"], record["outcome"]))

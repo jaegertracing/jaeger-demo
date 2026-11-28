@@ -17,9 +17,11 @@ MANIFESTS = {
     "opensearch": ("otel-demo/ingress/ingress-opensearch.yaml",),
     "otel-demo": ("otel-demo/ingress/ingress-otel-demo.yaml",),
 }
+# Both hosted demos load the same parameterized standard-library generator; each stack's
+# Deployment sets its own TARGET_URL and SLEEP_SECONDS.
 GENERATORS = {
-    "default": ("oci/load-generator/generate_traces.py", "oci/load-generator/requirements.txt"),
-    "jaeger": ("otel-demo/generate_traces.py", "otel-demo/load-generator/requirements.txt"),
+    "default": ("trace-generator/generate_traces.py",),
+    "jaeger": ("trace-generator/generate_traces.py",),
 }
 
 

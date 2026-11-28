@@ -22,7 +22,12 @@ spec:
           - /bin/sh
           - -c
           - |
-            pip install --no-cache-dir -r /app/requirements.txt && python /app/generate_traces.py
+            python /app/generate_traces.py
+        env:
+        - name: TARGET_URL
+          value: "http://jaeger-hotrod.default.svc.cluster.local:80/hotrod/dispatch"
+        - name: SLEEP_SECONDS
+          value: "10"
         volumeMounts:
         - name: script-volume
           mountPath: /app

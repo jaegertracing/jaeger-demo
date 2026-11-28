@@ -193,6 +193,7 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             shutil.copytree(deploy.ROOT / "examples/otel-demo", root / "examples/otel-demo")
+            shutil.copytree(deploy.ROOT / "examples/trace-generator", root / "examples/trace-generator")
             shutil.copytree(deploy.ROOT / "scripts/demo", root / "scripts/demo")
             script = root / "examples/otel-demo/deploy-all.sh"
             script.write_text(re.sub(r'OPENSEARCH_CHART_VERSION="[^\"]+"', 'OPENSEARCH_CHART_VERSION="99.99.99"', script.read_text()))

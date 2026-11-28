@@ -8,7 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 Renovate checks the two hosted demo directories daily. Releases must be at least seven days old, and maintainers review
 every update. OpenSearch and Dashboards remain a matched chart pair. Other updates
 are grouped by deployment component. Charts own their bundled image versions;
-direct image overrides and load-generator requirements are tracked separately.
+direct image overrides are tracked separately. The shared trace generator is
+standard-library Python and has no tracked requirements.
 OpenSearch stays within its configured major line until a reviewed migration or
 compatibility change updates that constraint. The OpenTelemetry Demo chart owns
 its PostgreSQL and Valkey images.

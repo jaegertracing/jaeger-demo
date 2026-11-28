@@ -31,15 +31,14 @@ COMPONENTS = {
     ]),
     "otel-jaeger": ("otel", "jaeger", [
         "jaeger-values.yaml", "jaeger-config.yaml", "jaeger-query-service.yaml",
-        "load-generator.yaml", "load-generator/requirements.txt", "generate_traces.py",
+        "load-generator.yaml", "../trace-generator/generate_traces.py",
         "ingress/ingress-jaeger.yaml", "ingress/ingress-opensearch.yaml",
         "ingress/ingress-otel-demo.yaml",
     ]),
     "otel-demo": ("otel", "otel-demo", ["otel-demo-values.yaml"]),
     "oci-jaeger": ("oci", "jaeger", [
         "jaeger-values.yaml", "config.yaml", "ui-config.json", "ingress.yaml",
-        "load-generator/load-generator.yaml", "load-generator/generate_traces.py",
-        "load-generator/requirements.txt",
+        "load-generator/load-generator.yaml", "../trace-generator/generate_traces.py",
     ]),
     "oci-monitoring": ("oci", "monitoring", ["monitoring-values.yaml", "prometheus-svc.yaml"]),
 }

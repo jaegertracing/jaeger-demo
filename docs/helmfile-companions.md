@@ -3,7 +3,7 @@
 
 # Supplemental resource adoption
 
-The local `demo-resources` chart defines one release in each of the four existing namespaces. The chart reads its allowlist from its own package. A render fails if a resource is missing, duplicated, of the wrong API version, outside the namespace, or outside the allowlist. It also fails if a source manifest carries any `helm.sh/hook` annotation, because Helm would not own that object and would delete and recreate it before each run. Every rendered object carries the Helm keep annotation. The chart takes the same Ingress, Service, Deployment and generator inputs as the extracted scripts. A ConfigMap embeds the exact script and requirements bytes for each generator. [Allowlist](../charts/demo-resources/allowlist.yaml)
+The local `demo-resources` chart defines one release in each of the four existing namespaces. The chart reads its allowlist from its own package. A render fails if a resource is missing, duplicated, of the wrong API version, outside the namespace, or outside the allowlist. It also fails if a source manifest carries any `helm.sh/hook` annotation, because Helm would not own that object and would delete and recreate it before each run. Every rendered object carries the Helm keep annotation. The chart takes the same Ingress, Service, Deployment and generator inputs as the extracted scripts. A ConfigMap embeds the exact script bytes for each generator. [Allowlist](../charts/demo-resources/allowlist.yaml)
 
 ## Render the public sources
 

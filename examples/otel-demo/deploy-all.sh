@@ -672,7 +672,7 @@ main() {
     wait_for_service_endpoints jaeger jaeger-hotrod 180
 
     log "Deploying HotROD trace generator"
-    kubectl -n jaeger create configmap trace-script --from-file="$SCRIPT_DIR/generate_traces.py" --from-file="$SCRIPT_DIR/load-generator/requirements.txt" --dry-run=client -o yaml | kubectl apply -f -
+    kubectl -n jaeger create configmap trace-script --from-file="$SCRIPT_DIR/../trace-generator/generate_traces.py" --dry-run=client -o yaml | kubectl apply -f -
     kubectl apply -n jaeger -f "$SCRIPT_DIR/load-generator.yaml"
     kubectl rollout restart deployment/trace-generator -n jaeger
     wait_for_deployment jaeger trace-generator "${ROLLOUT_TIMEOUT}s"

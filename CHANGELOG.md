@@ -24,6 +24,14 @@ Earlier hosted-demo history is in core up to the extraction cutoff below.
 
 ### Changed
 
+- The two hosted HotROD trace generators are one parameterized standard-library
+  script, `examples/trace-generator/generate_traces.py`, so the pods no longer
+  install `requests` at startup. Each stack keeps its target URL and request
+  interval through its Deployment's `TARGET_URL` and `SLEEP_SECONDS`: the OCI
+  stack dispatches to `jaeger-hotrod.default` every 10s, the OTel stack to
+  `jaeger-hotrod.jaeger` every 5s
+  (refs [#2](https://github.com/jaegertracing/jaeger-demo/issues/2)).
+
 - The [Helmfile adoption](docs/cutover.md#helmfile-adoption) runbook reads for the
   adopted demo: its recovery, rollback, repair and de-adoption steps are the
   operating procedures, `digest` is the committed image mode, a later adoption

@@ -224,7 +224,7 @@ fi
 if deploy_jaeger; then
   # Create ConfigMap for Trace Generator
   echo "🔵 Step 3: Creating ConfigMap for Trace Generator..."
-  kubectl create configmap trace-script --from-file=./load-generator/generate_traces.py --from-file=./load-generator/requirements.txt --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create configmap trace-script --from-file=../trace-generator/generate_traces.py --dry-run=client -o yaml | kubectl apply -f -
 
   # Deploy Trace Generator Pod
   echo "🟡 Step 4: Deploying Trace Generator Pod..."
